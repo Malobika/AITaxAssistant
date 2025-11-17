@@ -68,7 +68,7 @@ def build_master_table(data_dir: str) -> pd.DataFrame | None:
     return master_df
 
 
-st.title("PDF → Persistent Table (no tabula, no PyPDF2)")
+st.title("🧾 AI Tax Assistant")
 
 table = None
 
@@ -92,3 +92,9 @@ if table is not None:
 
     st.write("Columns in the table:")
     st.write(list(table.columns))
+
+
+if st.button("Clear All Cache"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.success("All cache cleared!")
