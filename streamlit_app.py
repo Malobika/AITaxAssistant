@@ -4,7 +4,7 @@ from openai import OpenAI
 import streamlit as st
 import pandas as pd
 import os
-import docx  # from python-docx
+from docx import Document  # from python-docx
 
 
 DOC_PATH = "./federal_tax_documents/federal_forms/f1040.docx"  # change to your file
