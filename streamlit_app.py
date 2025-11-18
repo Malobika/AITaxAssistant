@@ -359,14 +359,43 @@ if doc_file is not None:
             st.text(uploaded_text)
     else:
         st.info("Document uploaded but no text could be extracted.")
+import easyocr
+from PIL import Image
+import numpy as np
+
+# Load OCR model once
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(["en"], gpu=False)
+
+
+ocr_reader = load_ocr()
 
 # ---------------------------------------------------------
 # 🖼️ Handle image upload + preview
 # ---------------------------------------------------------
 if img_file is not None:
     st.markdown(f"**Image uploaded:** `{img_file.name}`")
+    #st.image(img_file, caption="Uploaded image", use_container_width=True)
+
+
+if img_file is not None:
+    st.markdown(f"**Image uploaded:** `{img_file.name}`")
     st.image(img_file, caption="Uploaded image", use_container_width=True)
 
+    # Convert to NumPy image
+    image = Image.open(img_file)
+    image_np = np.array(image)
+
+    st.write("🔍 Extracting text...")
+
+    # Run OCR
+    results = ocr_reader.readtext(image_np)
+
+    extracted_text = "\n".join([res[1] for res in results])
+
+    st.subheader("📄 OCR Output")
+    st.text(extracted_text)
 # ---------------------------------------------------------
 # 🔑 OpenAI setup
 # ---------------------------------------------------------

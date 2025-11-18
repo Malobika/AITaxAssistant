@@ -6,3 +6,5 @@ chromadb
 python-docx     
 unstructured      
 sentence-transformers 
+easyocr
+torch
