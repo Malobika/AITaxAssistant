@@ -1,4 +1,8 @@
 streamlit
-openai
-pandas
-python-docx
+langchain
+langchain-community
+langchain-google-genai 
+chromadb          
+python-docx     
+unstructured      
+sentence-transformers 
