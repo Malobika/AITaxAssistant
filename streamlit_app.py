@@ -221,16 +221,16 @@ def get_extracted_for_doc(doc_id: int) -> pd.DataFrame:
 
 # ---------- STREAMLIT APP ----------
 
-st.title("Ai tax assistant")
+
 
 # init DB on startup
 init_db()
 
-st.sidebar.header("Actions")
+#st.sidebar.header("Actions")
 
-if st.sidebar.button("Process / Reindex All Documents"):
-    docs, rows = process_all_documents()
-    st.success(f"Processed {docs} document(s), extracted {rows} cell(s).")
+
+docs, rows = process_all_documents()
+st.success(f"Processed {docs} document(s), extracted {rows} cell(s).")
 
 # List all documents from DB
 if os.path.exists(DB_PATH):
@@ -241,7 +241,7 @@ else:
 st.subheader("Documents in persistent DB")
 
 if docs_df.empty:
-    st.info("No documents indexed yet. Click 'Process / Reindex All Documents' in the sidebar.")
+    st.info("No documents indexed yet.")
 else:
     st.dataframe(docs_df)
 
@@ -278,3 +278,53 @@ else:
             )
     else:
         st.error(f"File not found on disk: {file_path}")
+
+
+st.title("💬 AI Assistant Chatbot")
+st.write(
+    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to help fill your tax forms. "
+)
+
+
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    st.info("Update your key.", icon="🗝️")
+else:
+
+    # Create an OpenAI client.
+    client = OpenAI(api_key=openai_api_key)
+
+    # Create a session state variable to store the chat messages. This ensures that the
+    # messages persist across reruns.
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display the existing chat messages via `st.chat_message`.
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Create a chat input field to allow the user to enter a message. This will display
+    # automatically at the bottom of the page.
+    if prompt := st.chat_input("Do you want to file your taxes?"):
+
+        # Store and display the current prompt.
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Generate a response using the OpenAI API.
+        stream = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ],
+            stream=True,
+        )
+
+        # Stream the response to the chat using `st.write_stream`, then store it in 
+        # session state.
+        with st.chat_message("assistant"):
+            response = st.write_stream(stream)
+        st.session_state.messages.append({"role": "assistant", "content": response})
