@@ -297,7 +297,7 @@ st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
 
 st.title("💬 AI Assistant Chatbot")
 st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to help fill your tax forms."
+    "This is a simple chatbot that uses OpenAI's GPT model to help fill your tax forms."
 )
 
 # ---------------------------------------------------------
