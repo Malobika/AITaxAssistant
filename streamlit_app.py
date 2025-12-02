@@ -20,6 +20,18 @@ st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# checklist structure:
+# [
+#   {
+#     "heading": "Collect W-2 forms",
+#     "status": "pending" | "done",
+#     "details": [
+#        {"item": "...", "status": "pending" | "done"},
+#        ...
+#     ]
+#   },
+#   ...
+# ]
 if "checklist" not in st.session_state:
     st.session_state.checklist = []
 
@@ -251,8 +263,24 @@ ocr_reader = load_ocr()
 def build_tax_checklist(client: OpenAI, chat_messages, user_profile: dict):
     """
     Use the LLM to generate/update a tax-filing checklist from the chat history
-    and the user's profile. Returns a list of dicts:
-    [{"item": "...", "status": "done" | "pending"}, ...]
+    and the user's profile.
+
+    Expected JSON shape:
+
+    {
+      "sections": [
+        {
+          "heading": "Collect W-2 forms",
+          "status": "pending",
+          "details": [
+            {"item": "Collect W-2 from each employer", "status": "pending"},
+            {"item": "Confirm employer name, address, and EIN (Box b)", "status": "pending"},
+            {"item": "Record wages (Box 1) and federal income tax withheld (Box 2)", "status": "pending"}
+          ]
+        },
+        ...
+      ]
+    }
     """
     if not chat_messages:
         return st.session_state.checklist  # nothing to update yet
@@ -267,26 +295,67 @@ def build_tax_checklist(client: OpenAI, chat_messages, user_profile: dict):
 
     system_prompt = """
 You are a careful US tax-filing assistant.
-Your job is to maintain a concise checklist of tax filing tasks and information
-the user needs, based on:
+
+Your job is to maintain a hierarchical checklist of tax filing tasks and
+information the user needs, based on:
 1) The conversation so far, and
 2) The user's profile (student vs working professional, visa status, W-2 status).
 
-Return ONLY valid JSON in this exact format:
+You MUST return ONLY valid JSON in this EXACT format:
 
 {
-  "items": [
-    {"item": "Describe the task...", "status": "done"},
-    {"item": "Another task...", "status": "pending"}
+  "sections": [
+    {
+      "heading": "Collect W-2 forms",
+      "status": "pending",
+      "details": [
+        {
+          "item": "Collect W-2 from each employer for the tax year",
+          "status": "pending"
+        },
+        {
+          "item": "Confirm employer name, address, and EIN (Box b)",
+          "status": "pending"
+        },
+        {
+          "item": "Record wages, tips, other compensation (Box 1)",
+          "status": "pending"
+        },
+        {
+          "item": "Record federal income tax withheld (Box 2)",
+          "status": "pending"
+        },
+        {
+          "item": "Capture Social Security and Medicare wages and tax (Boxes 3–6, if applicable)",
+          "status": "pending"
+        }
+      ]
+    }
   ]
 }
 
 Rules:
-- Mark a task as "done" ONLY if the conversation clearly indicates the user
-  already provided that info or completed that step.
-- Otherwise keep it "pending".
-- Prefer 5–12 items tailored to the user's situation.
-- Do NOT include explanations outside the JSON.
+- Use clear ACTION headings that reference specific forms when relevant, e.g.:
+  * "Collect W-2 forms"
+  * "Gather 1099-INT and 1099-DIV statements"
+  * "Gather 1099-NEC / 1099-K for self-employment income"
+  * "Collect Form 1098-T and tuition payment records"
+  * "Confirm filing information on Form 1040"
+- Under each heading, include 3–10 detailed sub-items ("details") that describe
+  concrete information to collect or verify, such as:
+  * Box numbers on W-2, 1099-INT, 1099-DIV, 1099-NEC, 1099-K
+  * Employer name/EIN, payer details
+  * Gross amounts, tax withheld, dates, etc.
+- Mark a detail as "done" ONLY if the conversation clearly indicates the user
+  has already provided that information or completed that step. Otherwise "pending".
+- The section "status" should be "done" ONLY if all or nearly all of its details
+  appear to be completed from the conversation.
+- Tailor sections to the profile:
+  * Students / on F-1: likely Form 1098-T, scholarship income, campus employment W-2s.
+  * Working professionals: W-2, 1099 income, retirement contributions, etc.
+  * Self-employed / 1099: business income, expenses, estimated taxes.
+- Provide between 4 and 10 sections total.
+- Do NOT include any explanation text outside the JSON.
 """.strip()
 
     user_profile_text = json.dumps(user_profile, indent=2)
@@ -319,18 +388,38 @@ Rules:
         end = raw.rindex("}") + 1
         json_str = raw[start:end]
         data = json.loads(json_str)
-        items = data.get("items", [])
-        # Normalize structure & status
-        normalized = []
-        for item in items:
-            text = str(item.get("item", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            if status not in ["done", "pending"]:
-                status = "pending"
-            if text:
-                normalized.append({"item": text, "status": status})
-        if normalized:
-            return normalized
+        sections = data.get("sections", [])
+
+        normalized_sections = []
+        for sec in sections:
+            heading = str(sec.get("heading", "")).strip()
+            if not heading:
+                continue
+            sec_status = str(sec.get("status", "pending")).lower()
+            if sec_status not in ["done", "pending"]:
+                sec_status = "pending"
+
+            details_raw = sec.get("details", [])
+            normalized_details = []
+            for det in details_raw:
+                text = str(det.get("item", "")).strip()
+                if not text:
+                    continue
+                d_status = str(det.get("status", "pending")).lower()
+                if d_status not in ["done", "pending"]:
+                    d_status = "pending"
+                normalized_details.append({"item": text, "status": d_status})
+
+            normalized_sections.append(
+                {
+                    "heading": heading,
+                    "status": sec_status,
+                    "details": normalized_details,
+                }
+            )
+
+        if normalized_sections:
+            return normalized_sections
     except Exception:
         # If parsing fails, keep the existing checklist
         pass
@@ -493,7 +582,6 @@ if img_file is not None:
     st.subheader("📄 OCR Output")
     st.text(extracted_text)
 
-
 # ---------------------------------------------------------
 # 🧍 User profile (sidebar) — student/working, visa, W2
 # ---------------------------------------------------------
@@ -534,7 +622,6 @@ with st.sidebar:
 
     if st.button("Reset checklist"):
         st.session_state.checklist = []
-
 
 # ---------------------------------------------------------
 # 🔑 OpenAI setup & Chat UI
@@ -597,26 +684,49 @@ else:
         )
 
 # ---------------------------------------------------------
-# 🧾 Checklist display in sidebar (with expander)
+# 🧾 Checklist display in sidebar (with headings + detailed sub-items)
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("🧾 Tax-filing Checklist")
 
     if st.session_state.checklist:
         with st.expander("View / update checklist", expanded=True):
-            for i, item in enumerate(st.session_state.checklist):
-                label = item.get("item", "")
-                status = item.get("status", "pending").lower()
-                checked = status == "done"
+            for s_idx, section in enumerate(st.session_state.checklist):
+                heading = section.get("heading", "Unnamed section")
+                sec_status = section.get("status", "pending").lower()
+                details = section.get("details", [])
 
-                # Interactive checkbox: let user override done/pending
-                new_checked = st.checkbox(
-                    label,
-                    value=checked,
-                    key=f"checklist_item_{i}",
+                st.markdown(f"**{heading}**")
+
+                # Section-level checkbox
+                section_done_default = sec_status == "done"
+                new_section_done = st.checkbox(
+                    f"Mark section '{heading}' as complete",
+                    value=section_done_default,
+                    key=f"section_done_{s_idx}",
                 )
-                st.session_state.checklist[i]["status"] = (
-                    "done" if new_checked else "pending"
-                )
+
+                # If user marks section complete, mark all details as done as well
+                if new_section_done:
+                    st.session_state.checklist[s_idx]["status"] = "done"
+                else:
+                    st.session_state.checklist[s_idx]["status"] = "pending"
+
+                # Sub-items (details) with slight "indentation" in label
+                for d_idx, det in enumerate(details):
+                    d_label = det.get("item", "")
+                    d_status = det.get("status", "pending").lower()
+                    d_checked_default = d_status == "done"
+
+                    new_d_checked = st.checkbox(
+                        "• " + d_label,
+                        value=d_checked_default,
+                        key=f"detail_{s_idx}_{d_idx}",
+                    )
+                    st.session_state.checklist[s_idx]["details"][d_idx]["status"] = (
+                        "done" if new_d_checked else "pending"
+                    )
+
+                st.markdown("---")
     else:
         st.info("Start chatting to generate a personalized tax-filing checklist.")
