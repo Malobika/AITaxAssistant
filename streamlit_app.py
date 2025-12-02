@@ -3,90 +3,113 @@ from openai import OpenAI
 import os
 import json
 
-# ---------------------------------------------------------
-# 🌐 Streamlit config & session state
-# ---------------------------------------------------------
 st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
 
-# Conversation that the Intake Agent sees
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of {role, content}
+# ------------------- NEW: visual snippet memory -------------------
+# In the future, each snippet could come from a RAG chunk.
+VISUAL_SNIPPETS = {
+    "w2_to_1040nr": [
+        # Step 1: overall + Box 1
+        """
+# ---------------------------------------------------------
+#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 1)
+#   Focus: layout + Box 1 (wages)
+# ---------------------------------------------------------
+#  W-2 Box 1 : Wages, tips, other compensation
+#  → Form 1040-NR Line 1a
+#    ("Total amount from Form(s) W-2, box 1")
+# ---------------------------------------------------------
+        """.strip("\n"),
 
-# Hierarchical checklist the Checklist Agent maintains
-# [
-#   {
-#     "heading": "Collect W-2 forms",
-#     "status": "pending" | "done",
-#     "details": [
-#        {"item": "...", "status": "pending" | "done"},
-#        ...
-#     ]
-#   },
-#   ...
-# ]
-if "checklist" not in st.session_state:
-    st.session_state.checklist = []
+        # Step 2: Box 2
+        """
+# ---------------------------------------------------------
+#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 2)
+#   Focus: Box 2 (federal tax withheld)
+# ---------------------------------------------------------
+#  W-2 Box 2 : Federal income tax withheld
+#  → Form 1040-NR Line 25a
+#    ("Federal income tax withheld from Form(s) W-2")
+# ---------------------------------------------------------
+        """.strip("\n"),
 
-# User profile captured from sidebar radios/selectboxes
-if "user_profile" not in st.session_state:
-    st.session_state.user_profile = {}
+        # Step 3: Social Security wages/tax
+        """
+# ---------------------------------------------------------
+#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 3)
+#   Focus: Boxes 3–4 (Social Security)
+# ---------------------------------------------------------
+#  W-2 Box 3 : Social security wages
+#  W-2 Box 4 : Social security tax withheld
+#  → Not entered directly on Form 1040-NR, but useful to
+#    verify your Social Security records and to check for
+#    excess withholding (Form 843 in special cases).
+# ---------------------------------------------------------
+        """.strip("\n"),
 
-# Track whether user clicked the W-2 visual help button
-if "show_w2_visual" not in st.session_state:
-    st.session_state.show_w2_visual = False
+        # Step 4: Medicare wages/tax
+        """
+# ---------------------------------------------------------
+#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 4)
+#   Focus: Boxes 5–6 (Medicare)
+# ---------------------------------------------------------
+#  W-2 Box 5 : Medicare wages and tips
+#  W-2 Box 6 : Medicare tax withheld
+#  → Not entered directly on Form 1040-NR, but used to
+#    verify Medicare withholding amounts.
+# ---------------------------------------------------------
+        """.strip("\n"),
 
+        # Step 5: Box 12, 14, and "other" info
+        """
 # ---------------------------------------------------------
-# W-2 → Form 1040-NR visual helper (ASCII style)
+#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 5)
+#   Focus: Box 12, Box 14, and "other" info
 # ---------------------------------------------------------
-W2_1040NR_VISUAL = """
+#  W-2 Box 12 : Codes (D, E, G, etc. for retirement/benefits)
+#    → May affect other forms (e.g., Form 8880, retirement
+#      contributions) but not a single 1040-NR line by itself.
+#
+#  W-2 Box 14 : "Other" information (state tax, union dues, etc.)
+#    → Often relevant for state returns or recordkeeping.
 # ---------------------------------------------------------
-#              W-2: KEY BOXES (EMPLOYEE COPY)
-# ---------------------------------------------------------
-#  Box 1 : Wages, tips, other compensation
-#  Box 2 : Federal income tax withheld
-#  Box 3 : Social security wages
-#  Box 4 : Social security tax withheld
-#  Box 5 : Medicare wages and tips
-#  Box 6 : Medicare tax withheld
-#  Box 12: Codes (D, E, G, etc. - retirement, benefits, etc.)
-#  Box 14: Other (state tax, union dues, etc., depending on employer)
-# ---------------------------------------------------------
+        """.strip("\n"),
+    ]
+}
 
-# ---------------------------------------------------------
-#        W-2  →  FORM 1040-NR MAPPING (2024-style)
-# ---------------------------------------------------------
-#  W-2 Box 1  : Wages, tips, other compensation
-#               -> Form 1040-NR, Line 1a
-#                  ("Total amount from Form(s) W-2, box 1")
-#
-#  W-2 Box 2  : Federal income tax withheld
-#               -> Form 1040-NR, Line 25a
-#                  ("Federal income tax withheld from Form(s) W-2")
-#
-#  W-2 Box 3  : Social security wages
-#               -> Not entered directly on Form 1040-NR,
-#                  but used to verify Social Security records.
-#
-#  W-2 Box 4  : Social security tax withheld
-#               -> Not entered directly on Form 1040-NR.
-#                  Relevant if you had excess withholding (Form 843).
-#
-#  W-2 Box 5  : Medicare wages and tips
-#               -> Not entered directly on Form 1040-NR;
-#                  used to verify Medicare withholding.
-#
-#  W-2 Box 6  : Medicare tax withheld
-#               -> Not entered directly on Form 1040-NR.
-#
-#  W-2 Box 12 : Various codes (retirement plans, benefits, etc.)
-#               -> May affect other forms/lines (e.g., Form 8880,
-#                  retirement contributions). Check code-by-code.
-#
-#  W-2 Box 14 : "Other" information
-#               -> Depends on description. Sometimes relates to
-#                  state returns, union dues, etc.
-# ---------------------------------------------------------
-""".strip("\n")
+# Memory: which snippet index per topic (RAG-like pointer, but simple counter)
+if "visual_indices" not in st.session_state:
+    st.session_state.visual_indices = {}
+
+def get_next_visual_snippets(topic: str):
+    """
+    Return all snippets up to the current index for a topic
+    and advance the index by 1 (until the end).
+    This is a simple stand-in for a future RAG-based retriever.
+    """
+    steps = VISUAL_SNIPPETS.get(topic, [])
+    if not steps:
+        return []
+
+    current_idx = st.session_state.visual_indices.get(topic, 0)
+
+    # Clamp index
+    if current_idx < 0:
+        current_idx = 0
+    if current_idx >= len(steps):
+        current_idx = len(steps) - 1
+
+    # Snippets to show: from 0 .. current_idx
+    snippets_to_show = steps[: current_idx + 1]
+
+    # Advance index for next time (but don't go past last)
+    if current_idx < len(steps) - 1:
+        st.session_state.visual_indices[topic] = current_idx + 1
+    else:
+        st.session_state.visual_indices[topic] = current_idx  # stay at last
+
+    return snippets_to_show
+# -----------------------------------------------------------------
 
 
 # ---------------------------------------------------------
@@ -380,16 +403,36 @@ if client is not None:
             st.session_state.user_profile,
         )
 
-# ---------------------------------------------------------
-# 🔘 Visual W-2 help button (part of Intake Agent experience)
-# ---------------------------------------------------------
-st.markdown("### Need more visual help with your W-2 → Form 1040-NR mapping?")
 
-if st.button("🧾 Show W-2 → 1040-NR visual guide"):
-    st.session_state.show_w2_visual = True
+# ---------------------------------------------------------
+# 🔘 Incremental visual help (can be W-2 or other topics)
+# ---------------------------------------------------------
+st.markdown("### Need more visual help with how a form box maps to 1040-NR?")
 
-if st.session_state.show_w2_visual:
-    st.text(W2_1040NR_VISUAL)
+# For now we hardcode W-2, but this 'topic' could later be
+# any key that comes from a RAG result.
+topic = "w2_to_1040nr"
+
+col_v1, col_v2 = st.columns([1, 2])
+with col_v1:
+    if st.button("🧾 Show next W-2 → 1040-NR step"):
+        # This just advances the counter in memory.
+        # No RAG yet, just list-based snippets.
+        snippets = get_next_visual_snippets(topic)
+        st.session_state[f"visual_snippets_{topic}"] = snippets
+
+with col_v2:
+    # Render whatever we have so far for this topic
+    snippets = st.session_state.get(f"visual_snippets_{topic}", [])
+    if snippets:
+        for snip in snippets:
+            st.text(snip)
+    else:
+        st.caption(
+            "Click the button to see the first W-2 → 1040-NR mapping snippet. "
+            "Each click reveals the next column/box."
+        )
+
 
 # ---------------------------------------------------------
 # 🧾 Read-only dynamic checklist (Checklist Agent output)
