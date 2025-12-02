@@ -1,28 +1,41 @@
 import streamlit as st
 from openai import OpenAI
 
-import streamlit as st
 import pandas as pd
 import os
 from docx import Document  # from python-docx
-
-
-
-
 import sqlite3
 from glob import glob
-
-
-
 import pdfplumber
+import easyocr
+from PIL import Image
+import numpy as np
+import json
 
+# ---------------------------------------------------------
+# 🌐 Streamlit config & session state
+# ---------------------------------------------------------
+st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "checklist" not in st.session_state:
+    st.session_state.checklist = []
+
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = {}
+
+# ---------------------------------------------------------
+# Constants
+# ---------------------------------------------------------
 DATA_DIR = "./federal_tax_documents/federal_forms"
 DB_PATH = "./documents.db"
 
 
+# ---------------------------------------------------------
 # ---------- DB SETUP ----------
-
+# ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -103,8 +116,9 @@ def insert_extracted_rows(doc_id: int, rows: list[dict]):
     conn.close()
 
 
+# ---------------------------------------------------------
 # ---------- EXTRACTION HELPERS ----------
-
+# ---------------------------------------------------------
 def extract_pdf_tables(file_path: str) -> list[dict]:
     """
     Extract all tables from a PDF as list of {row_index, col_index, text}.
@@ -158,8 +172,9 @@ def extract_docx_lines(file_path: str) -> list[dict]:
     return extracted
 
 
+# ---------------------------------------------------------
 # ---------- PROCESS ALL DOCUMENTS ----------
-
+# ---------------------------------------------------------
 def process_all_documents():
     """
     Scan DATA_DIR for .pdf and .docx,
@@ -219,15 +234,121 @@ def get_extracted_for_doc(doc_id: int) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------
+# OCR SETUP
+# ---------------------------------------------------------
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(["en"], gpu=False)
+
+
+ocr_reader = load_ocr()
+
+
+# ---------------------------------------------------------
+# LLM-based dynamic checklist helper
+# ---------------------------------------------------------
+def build_tax_checklist(client: OpenAI, chat_messages, user_profile: dict):
+    """
+    Use the LLM to generate/update a tax-filing checklist from the chat history
+    and the user's profile. Returns a list of dicts:
+    [{"item": "...", "status": "done" | "pending"}, ...]
+    """
+    if not chat_messages:
+        return st.session_state.checklist  # nothing to update yet
+
+    # Turn chat messages into a plain-text conversation transcript
+    convo_lines = []
+    for m in chat_messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        convo_lines.append(f"{role.upper()}: {content}")
+    convo_text = "\n\n".join(convo_lines)
+
+    system_prompt = """
+You are a careful US tax-filing assistant.
+Your job is to maintain a concise checklist of tax filing tasks and information
+the user needs, based on:
+1) The conversation so far, and
+2) The user's profile (student vs working professional, visa status, W-2 status).
+
+Return ONLY valid JSON in this exact format:
+
+{
+  "items": [
+    {"item": "Describe the task...", "status": "done"},
+    {"item": "Another task...", "status": "pending"}
+  ]
+}
+
+Rules:
+- Mark a task as "done" ONLY if the conversation clearly indicates the user
+  already provided that info or completed that step.
+- Otherwise keep it "pending".
+- Prefer 5–12 items tailored to the user's situation.
+- Do NOT include explanations outside the JSON.
+""".strip()
+
+    user_profile_text = json.dumps(user_profile, indent=2)
+
+    checklist_resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": f"User profile:\n{user_profile_text}",
+            },
+            {
+                "role": "user",
+                "content": f"Conversation so far:\n\n{convo_text}",
+            },
+        ],
+    )
+
+    raw = checklist_resp.choices[0].message.content or ""
+
+    # Try to parse JSON out of the response
+    try:
+        # In case the model adds stray text, pull out the first {...} block
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        json_str = raw[start:end]
+        data = json.loads(json_str)
+        items = data.get("items", [])
+        # Normalize structure & status
+        normalized = []
+        for item in items:
+            text = str(item.get("item", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            if status not in ["done", "pending"]:
+                status = "pending"
+            if text:
+                normalized.append({"item": text, "status": status})
+        if normalized:
+            return normalized
+    except Exception:
+        # If parsing fails, keep the existing checklist
+        pass
+
+    return st.session_state.checklist
+
+
+# ---------------------------------------------------------
 # ---------- STREAMLIT APP ----------
+# ---------------------------------------------------------
 
-
+st.title("💬 AI Assistant Chatbot")
+st.write(
+    "This is a simple chatbot that uses OpenAI's GPT model to help fill your tax forms."
+)
 
 # init DB on startup
 init_db()
-
-#st.sidebar.header("Actions")
-
 
 docs, rows = process_all_documents()
 st.success(f"Processed {docs} document(s), extracted {rows} cell(s).")
@@ -246,8 +367,13 @@ else:
     st.dataframe(docs_df)
 
     # Select a document to view
-    doc_options = {f'{row["filename"]} ({row["file_type"]})': row["id"] for _, row in docs_df.iterrows()}
-    selected_label = st.selectbox("Select a document to view extracted data:", list(doc_options.keys()))
+    doc_options = {
+        f'{row["filename"]} ({row["file_type"]})': row["id"]
+        for _, row in docs_df.iterrows()
+    }
+    selected_label = st.selectbox(
+        "Select a document to view extracted data:", list(doc_options.keys())
+    )
     selected_doc_id = doc_options[selected_label]
 
     # Show extracted rows for that document
@@ -259,9 +385,7 @@ else:
     else:
         st.dataframe(extracted_df)
 
-    # "Link" / download button for the document
-    # (This is the closest thing to a link for local files in Streamlit Cloud)
-    # We look up the file_path from DB:
+    # Download button for the original document
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT file_path FROM documents WHERE id = ?", (selected_doc_id,))
@@ -279,29 +403,8 @@ else:
     else:
         st.error(f"File not found on disk: {file_path}")
 
-
-
-# Optional: install if you want PDF/DOCX text extraction
-# pip install pypdf2 python-docx
-try:
-    from PyPDF2 import PdfReader
-except ImportError:
-    PdfReader = None
-
-try:
-    from docx import Document
-except ImportError:
-    Document = None
-
-st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
-
-st.title("💬 AI Assistant Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT model to help fill your tax forms."
-)
-
 # ---------------------------------------------------------
-# 🔹 Upload Area: 2 Columns (Documents & Images)
+# 📄 / 🖼️ Upload Area: 2 Columns (Documents & Images)
 # ---------------------------------------------------------
 col1, col2 = st.columns(2)
 
@@ -326,6 +429,16 @@ uploaded_text = None  # text extracted from uploaded document (if any)
 # ---------------------------------------------------------
 # 📄 Handle document upload + preview
 # ---------------------------------------------------------
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+except ImportError:
+    DocxDocument = None
+
 if doc_file is not None:
     st.markdown(f"**Document uploaded:** `{doc_file.name}`")
 
@@ -346,10 +459,10 @@ if doc_file is not None:
     elif doc_file.type in [
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ]:
-        if Document is None:
+        if DocxDocument is None:
             st.warning("python-docx is not installed. Run `pip install python-docx`.")
         else:
-            doc = Document(doc_file)
+            doc = DocxDocument(doc_file)
             paragraphs = [p.text for p in doc.paragraphs]
             uploaded_text = "\n".join(paragraphs)
 
@@ -359,28 +472,11 @@ if doc_file is not None:
             st.text(uploaded_text)
     else:
         st.info("Document uploaded but no text could be extracted.")
-import easyocr
-from PIL import Image
-import numpy as np
-
-# Load OCR model once
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(["en"], gpu=False)
-
-
-ocr_reader = load_ocr()
 
 # ---------------------------------------------------------
-# 🖼️ Handle image upload + preview
+# 🖼️ Handle image upload + OCR
 # ---------------------------------------------------------
-#if img_file is not None:
-    #st.markdown(f"**Image uploaded:** `{img_file.name}`")
-    #st.image(img_file, caption="Uploaded image", use_container_width=True)
-
-
 if img_file is not None:
-    #st.markdown(f"**Image uploaded:** `{img_file.name}`")
     st.image(img_file, caption="Uploaded image", use_container_width=True)
 
     # Convert to NumPy image
@@ -396,8 +492,52 @@ if img_file is not None:
 
     st.subheader("📄 OCR Output")
     st.text(extracted_text)
+
+
 # ---------------------------------------------------------
-# 🔑 OpenAI setup
+# 🧍 User profile (sidebar) — student/working, visa, W2
+# ---------------------------------------------------------
+with st.sidebar:
+    st.header("👤 Your Tax Profile")
+
+    user_type = st.radio(
+        "I am a...",
+        ("Student", "Working professional"),
+        index=0,
+        key="user_type_radio",
+    )
+
+    visa_status = st.radio(
+        "Are you currently on a visa in the U.S.?",
+        ("Yes", "No"),
+        index=0,
+        key="visa_status_radio",
+    )
+
+    w2_status = st.selectbox(
+        "What best describes your W-2 / income status?",
+        (
+            "I receive a W-2 from an employer",
+            "I am self-employed / 1099 contractor",
+            "Both W-2 and self-employment/1099",
+            "None / other",
+        ),
+        key="w2_status_select",
+    )
+
+    # Save profile into session_state
+    st.session_state.user_profile = {
+        "employment_status": user_type,
+        "on_visa": visa_status,
+        "w2_status": w2_status,
+    }
+
+    if st.button("Reset checklist"):
+        st.session_state.checklist = []
+
+
+# ---------------------------------------------------------
+# 🔑 OpenAI setup & Chat UI
 # ---------------------------------------------------------
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
@@ -407,10 +547,6 @@ else:
     # Create an OpenAI client.
     client = OpenAI(api_key=openai_api_key)
 
-    # Session state for chat messages
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
     # Display previous messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -419,7 +555,6 @@ else:
     # Chat input
     prompt = st.chat_input("Do you want to file your taxes?")
     if prompt:
-
         # Optionally inject uploaded document text into the context
         if uploaded_text:
             prompt_with_context = (
@@ -437,7 +572,7 @@ else:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate response
+        # Generate response (streaming)
         stream = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -453,3 +588,35 @@ else:
         st.session_state.messages.append(
             {"role": "assistant", "content": response}
         )
+
+        # 🔄 Update checklist after each turn, based on profile + conversation
+        st.session_state.checklist = build_tax_checklist(
+            client,
+            st.session_state.messages,
+            st.session_state.user_profile,
+        )
+
+# ---------------------------------------------------------
+# 🧾 Checklist display in sidebar (with expander)
+# ---------------------------------------------------------
+with st.sidebar:
+    st.header("🧾 Tax-filing Checklist")
+
+    if st.session_state.checklist:
+        with st.expander("View / update checklist", expanded=True):
+            for i, item in enumerate(st.session_state.checklist):
+                label = item.get("item", "")
+                status = item.get("status", "pending").lower()
+                checked = status == "done"
+
+                # Interactive checkbox: let user override done/pending
+                new_checked = st.checkbox(
+                    label,
+                    value=checked,
+                    key=f"checklist_item_{i}",
+                )
+                st.session_state.checklist[i]["status"] = (
+                    "done" if new_checked else "pending"
+                )
+    else:
+        st.info("Start chatting to generate a personalized tax-filing checklist.")
