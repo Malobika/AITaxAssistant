@@ -5,7 +5,25 @@ import json
 
 st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
 
-# ------------------- NEW: visual snippet memory -------------------
+# ---------------------------------------------------------
+# 🔁 Session state initialization
+# ---------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # chat history for Intake Agent
+
+if "checklist" not in st.session_state:
+    st.session_state.checklist = []  # hierarchical checklist from Checklist Agent
+
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = {}  # profile (student/working, visa, W2 status)
+
+# Memory: which snippet index per topic (RAG-like pointer, but simple counter)
+if "visual_indices" not in st.session_state:
+    st.session_state.visual_indices = {}
+
+# ---------------------------------------------------------
+# 🧾 Visual snippet memory (incremental / RAG-friendly)
+# ---------------------------------------------------------
 # In the future, each snippet could come from a RAG chunk.
 VISUAL_SNIPPETS = {
     "w2_to_1040nr": [
@@ -77,9 +95,6 @@ VISUAL_SNIPPETS = {
     ]
 }
 
-# Memory: which snippet index per topic (RAG-like pointer, but simple counter)
-if "visual_indices" not in st.session_state:
-    st.session_state.visual_indices = {}
 
 def get_next_visual_snippets(topic: str):
     """
@@ -109,7 +124,6 @@ def get_next_visual_snippets(topic: str):
         st.session_state.visual_indices[topic] = current_idx  # stay at last
 
     return snippets_to_show
-# -----------------------------------------------------------------
 
 
 # ---------------------------------------------------------
@@ -120,24 +134,6 @@ def build_tax_checklist(client: OpenAI, chat_messages, user_profile: dict):
     Checklist Agent:
     Uses the entire conversation + user profile to generate/update
     a hierarchical tax-filing checklist with detailed sub-items.
-
-    Expected JSON shape:
-
-    {
-      "sections": [
-        {
-          "heading": "Collect W-2 forms",
-          "status": "pending",
-          "details": [
-            {"item": "Collect W-2 from each employer for the tax year", "status": "pending"},
-            {"item": "Confirm employer name, address, and EIN (Box b)", "status": "pending"},
-            {"item": "Record wages, tips, other compensation (Box 1)", "status": "pending"},
-            {"item": "Record federal income tax withheld (Box 2)", "status": "pending"}
-          ]
-        },
-        ...
-      ]
-    }
     """
     if not chat_messages:
         return st.session_state.checklist  # nothing to update yet
@@ -394,7 +390,9 @@ if client is not None:
             response_text = st.write_stream(stream)
 
         # Save assistant response
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": response_text}
+        )
 
         # After each user+assistant turn, call Checklist Agent to update the checklist
         st.session_state.checklist = build_tax_checklist(
@@ -402,7 +400,6 @@ if client is not None:
             st.session_state.messages,
             st.session_state.user_profile,
         )
-
 
 # ---------------------------------------------------------
 # 🔘 Incremental visual help (can be W-2 or other topics)
@@ -432,7 +429,6 @@ with col_v2:
             "Click the button to see the first W-2 → 1040-NR mapping snippet. "
             "Each click reveals the next column/box."
         )
-
 
 # ---------------------------------------------------------
 # 🧾 Read-only dynamic checklist (Checklist Agent output)
