@@ -31,6 +31,63 @@ if "checklist" not in st.session_state:
 if "user_profile" not in st.session_state:
     st.session_state.user_profile = {}
 
+# Track whether user clicked the W-2 visual help button
+if "show_w2_visual" not in st.session_state:
+    st.session_state.show_w2_visual = False
+
+# ---------------------------------------------------------
+# W-2 → Form 1040-NR visual helper (ASCII style)
+# ---------------------------------------------------------
+W2_1040NR_VISUAL = """
+# ---------------------------------------------------------
+#              W-2: KEY BOXES (EMPLOYEE COPY)
+# ---------------------------------------------------------
+#  Box 1 : Wages, tips, other compensation
+#  Box 2 : Federal income tax withheld
+#  Box 3 : Social security wages
+#  Box 4 : Social security tax withheld
+#  Box 5 : Medicare wages and tips
+#  Box 6 : Medicare tax withheld
+#  Box 12: Codes (D, E, G, etc. - retirement, benefits, etc.)
+#  Box 14: Other (state tax, union dues, etc., depending on employer)
+# ---------------------------------------------------------
+
+# ---------------------------------------------------------
+#        W-2  →  FORM 1040-NR MAPPING (2024-style)
+# ---------------------------------------------------------
+#  W-2 Box 1  : Wages, tips, other compensation
+#               -> Form 1040-NR, Line 1a
+#                  ("Total amount from Form(s) W-2, box 1")
+#
+#  W-2 Box 2  : Federal income tax withheld
+#               -> Form 1040-NR, Line 25a
+#                  ("Federal income tax withheld from Form(s) W-2")
+#
+#  W-2 Box 3  : Social security wages
+#               -> Not entered directly on Form 1040-NR,
+#                  but used to verify Social Security records.
+#
+#  W-2 Box 4  : Social security tax withheld
+#               -> Not entered directly on Form 1040-NR.
+#                  Relevant if you had excess withholding (Form 843).
+#
+#  W-2 Box 5  : Medicare wages and tips
+#               -> Not entered directly on Form 1040-NR;
+#                  used to verify Medicare withholding.
+#
+#  W-2 Box 6  : Medicare tax withheld
+#               -> Not entered directly on Form 1040-NR.
+#
+#  W-2 Box 12 : Various codes (retirement plans, benefits, etc.)
+#               -> May affect other forms/lines (e.g., Form 8880,
+#                  retirement contributions). Check code-by-code.
+#
+#  W-2 Box 14 : "Other" information
+#               -> Depends on description. Sometimes relates to
+#                  state returns, union dues, etc.
+# ---------------------------------------------------------
+""".strip("\n")
+
 
 # ---------------------------------------------------------
 # 🧠 Checklist Agent helper
@@ -120,7 +177,7 @@ Rules:
   * "Gather 1099-NEC / 1099-K for self-employment income"
   * "Collect Form 1098-T and tuition payment records"
   * "Summarize other income (interest, dividends, scholarships, etc.)"
-  * "Confirm filing information on Form 1040"
+  * "Confirm filing information on Form 1040-NR"
 - Under each heading, include 3–10 detailed sub-items ("details") that describe
   concrete information to collect or verify (box numbers, amounts, payer/employer,
   dates, etc.), not vague phrases.
@@ -294,7 +351,9 @@ if client is not None:
             st.markdown(message["content"])
 
     # Chat input
-    prompt = st.chat_input("Tell me how I can help with your taxes today (e.g., 'I need help with my W-2').")
+    prompt = st.chat_input(
+        "Tell me how I can help with your taxes today (e.g., 'I need help with my W-2')."
+    )
     if prompt:
         # Add user message to conversation
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -320,6 +379,17 @@ if client is not None:
             st.session_state.messages,
             st.session_state.user_profile,
         )
+
+# ---------------------------------------------------------
+# 🔘 Visual W-2 help button (part of Intake Agent experience)
+# ---------------------------------------------------------
+st.markdown("### Need more visual help with your W-2 → Form 1040-NR mapping?")
+
+if st.button("🧾 Show W-2 → 1040-NR visual guide"):
+    st.session_state.show_w2_visual = True
+
+if st.session_state.show_w2_visual:
+    st.text(W2_1040NR_VISUAL)
 
 # ---------------------------------------------------------
 # 🧾 Read-only dynamic checklist (Checklist Agent output)
