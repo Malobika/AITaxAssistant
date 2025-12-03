@@ -10,6 +10,8 @@ import streamlit as st
 from openai import OpenAI
 import os
 import json
+import re
+from typing import Dict, List, Tuple
 
 # RAG imports
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -45,6 +47,165 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "federal_tax_documents"
 
 st.set_page_config(page_title="AI Tax Assistant", page_icon="💬", layout="wide")
+
+# ==========================================
+# Legal Disclaimers and Privacy Notices
+# ==========================================
+LEGAL_DISCLAIMER = """
+⚠️ **IMPORTANT DISCLAIMER**
+
+This AI Tax Assistant is for **educational and informational purposes only**.
+
+• I am NOT a Certified Public Accountant (CPA), tax attorney, or licensed tax professional.
+• This tool does NOT constitute professional tax advice, legal advice, or financial advice.
+• Tax laws are complex and vary by individual circumstances. Always consult a qualified tax professional.
+• You are solely responsible for the accuracy of your tax filings.
+• The developers of this tool are not liable for any errors or omissions.
+
+By using this tool, you acknowledge and accept these terms.
+"""
+
+PRIVACY_NOTICE = """
+🔒 **PRIVACY & DATA HANDLING NOTICE**
+
+• We automatically detect and mask sensitive information (SSN, EIN, account numbers).
+• Your data is processed in-session only and is NOT permanently stored.
+• Uploaded documents are processed temporarily and cleared after use.
+• We recommend NOT uploading documents containing actual SSNs or bank account numbers.
+• For maximum security, use sample/dummy data when learning how to file.
+
+Your privacy is important to us.
+"""
+
+# ==========================================
+# Custom CSS for Banners
+# ==========================================
+st.markdown("""
+<style>
+.disclaimer-banner {
+    background-color: #fff3cd;
+    border: 1px solid #ffc107;
+    border-radius: 5px;
+    padding: 10px 15px;
+    margin-bottom: 15px;
+    font-size: 0.85em;
+}
+.privacy-banner {
+    background-color: #d1ecf1;
+    border: 1px solid #17a2b8;
+    border-radius: 5px;
+    padding: 10px 15px;
+    margin-bottom: 15px;
+    font-size: 0.85em;
+}
+.pii-warning {
+    background-color: #f8d7da;
+    border: 1px solid #dc3545;
+    border-radius: 5px;
+    padding: 10px 15px;
+    margin: 10px 0;
+    font-size: 0.9em;
+}
+.upload-warning {
+    background-color: #fff3cd;
+    border: 1px solid #ffc107;
+    border-radius: 5px;
+    padding: 8px 12px;
+    margin: 5px 0;
+    font-size: 0.8em;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# PII Detection and Masking
+# ==========================================
+class PIIHandler:
+    """Handles detection and masking of Personally Identifiable Information"""
+    
+    PATTERNS = {
+        'ssn': [
+            r'\b\d{3}-\d{2}-\d{4}\b',
+            r'\b\d{3}\s\d{2}\s\d{4}\b',
+            r'\b\d{9}\b(?!\d)',
+        ],
+        'ein': [
+            r'\b\d{2}-\d{7}\b',
+        ],
+        'bank_account': [
+            r'\b\d{8,17}\b',
+        ],
+        'credit_card': [
+            r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',
+            r'\b\d{16}\b',
+        ],
+        'phone': [
+            r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',
+        ],
+        'email': [
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        ],
+    }
+    
+    MASKS = {
+        'ssn': '***-**-****',
+        'ein': '**-*******',
+        'bank_account': '[ACCOUNT-MASKED]',
+        'credit_card': '****-****-****-****',
+        'phone': '(***) ***-****',
+        'email': '[EMAIL-MASKED]',
+    }
+    
+    @classmethod
+    def detect_pii(cls, text: str) -> Dict[str, List[str]]:
+        found = {}
+        for pii_type, patterns in cls.PATTERNS.items():
+            matches = []
+            for pattern in patterns:
+                matches.extend(re.findall(pattern, text, re.IGNORECASE))
+            if matches:
+                found[pii_type] = list(set(matches))
+        return found
+    
+    @classmethod
+    def mask_pii(cls, text: str) -> Tuple[str, Dict[str, int]]:
+        masked_text = text
+        masked_counts = {}
+        
+        for pii_type, patterns in cls.PATTERNS.items():
+            count = 0
+            for pattern in patterns:
+                matches = re.findall(pattern, masked_text, re.IGNORECASE)
+                count += len(matches)
+                masked_text = re.sub(pattern, cls.MASKS[pii_type], masked_text, flags=re.IGNORECASE)
+            if count > 0:
+                masked_counts[pii_type] = count
+        
+        return masked_text, masked_counts
+    
+    @classmethod
+    def get_pii_warning(cls, detected: Dict[str, int]) -> str:
+        if not detected:
+            return ""
+        
+        warnings = ["⚠️ **Sensitive Information Detected & Masked:**"]
+        
+        pii_labels = {
+            'ssn': 'Social Security Number(s)',
+            'ein': 'Employer Identification Number(s)',
+            'bank_account': 'Bank Account Number(s)',
+            'credit_card': 'Credit Card Number(s)',
+            'phone': 'Phone Number(s)',
+            'email': 'Email Address(es)',
+        }
+        
+        for pii_type, count in detected.items():
+            label = pii_labels.get(pii_type, pii_type)
+            warnings.append(f"• {count} {label} detected and masked")
+        
+        warnings.append("\n*Your sensitive data has been automatically protected.*")
+        
+        return "\n".join(warnings)
 
 # ==========================================
 # RAG Setup (Cached)
@@ -125,10 +286,10 @@ def rag_search_for_visual(source_form: str, target_form: str, step: int) -> str:
     return ""
 
 # ==========================================
-# Document Text Extraction
+# Document Text Extraction (with PII masking)
 # ==========================================
 def extract_text_from_file(uploaded_file):
-    """Extract text from uploaded document"""
+    """Extract text from uploaded document with PII masking"""
     file_type = uploaded_file.type
     text = ""
     
@@ -137,32 +298,42 @@ def extract_text_from_file(uploaded_file):
             text = uploaded_file.read().decode("utf-8", errors="ignore")
         elif file_type == "application/pdf":
             if not PDF_AVAILABLE:
-                return "❌ PDF support not installed. Run: pip install PyPDF2"
+                return "❌ PDF support not installed.", {}, ""
             reader = PdfReader(uploaded_file)
             text = "\n".join([page.extract_text() or "" for page in reader.pages[:10]])
         elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             if not DOCX_AVAILABLE:
-                return "❌ DOCX support not installed. Run: pip install python-docx"
+                return "❌ DOCX support not installed.", {}, ""
             doc = Document(uploaded_file)
             text = "\n".join([p.text for p in doc.paragraphs])
     except Exception as e:
-        text = f"❌ Error extracting text: {str(e)}"
+        return f"❌ Error extracting text: {str(e)}", {}, ""
     
-    return text
+    # Mask PII
+    masked_text, pii_counts = PIIHandler.mask_pii(text)
+    warning = PIIHandler.get_pii_warning(pii_counts) if pii_counts else ""
+    
+    return masked_text, pii_counts, warning
 
 def extract_text_from_image(uploaded_image):
-    """Extract text from image using OCR"""
+    """Extract text from image using OCR with PII masking"""
     if not OCR_AVAILABLE:
-        return "❌ OCR not installed. Run: pip install easyocr pillow"
+        return "❌ OCR not installed.", {}, ""
     
     try:
         ocr_reader = load_ocr()
         image = Image.open(uploaded_image)
         image_np = np.array(image)
         results = ocr_reader.readtext(image_np)
-        return "\n".join([res[1] for res in results])
+        text = "\n".join([res[1] for res in results])
+        
+        # Mask PII
+        masked_text, pii_counts = PIIHandler.mask_pii(text)
+        warning = PIIHandler.get_pii_warning(pii_counts) if pii_counts else ""
+        
+        return masked_text, pii_counts, warning
     except Exception as e:
-        return f"❌ OCR Error: {str(e)}"
+        return f"❌ OCR Error: {str(e)}", {}, ""
 
 # ==========================================
 # Session State Initialization
@@ -533,10 +704,40 @@ if not openai_api_key:
 client = OpenAI(api_key=openai_api_key)
 
 # ==========================================
-# Page Title & Description
+# Page Title & Legal Disclaimer Banner
 # ==========================================
 st.title("💬 AI Tax Assistant")
 st.caption("Powered by OpenAI GPT + RAG (ChromaDB) with Visual Form Mapping")
+
+# Legal Disclaimer Banner (Always Visible)
+st.markdown("""
+<div class="disclaimer-banner">
+⚠️ <strong>IMPORTANT:</strong> This AI assistant is for <strong>educational purposes only</strong>. 
+It is NOT a substitute for professional tax advice from a CPA or tax attorney. 
+You are solely responsible for the accuracy of your tax filings.
+</div>
+""", unsafe_allow_html=True)
+
+# Full disclaimer in expander
+with st.expander("📜 Full Legal Disclaimer & Privacy Notice", expanded=False):
+    tab1, tab2 = st.tabs(["⚖️ Legal Disclaimer", "🔒 Privacy Notice"])
+    
+    with tab1:
+        st.markdown(LEGAL_DISCLAIMER)
+    
+    with tab2:
+        st.markdown(PRIVACY_NOTICE)
+    
+    # Acknowledgment checkbox
+    if 'disclaimer_acknowledged' not in st.session_state:
+        st.session_state.disclaimer_acknowledged = False
+    
+    acknowledged = st.checkbox(
+        "I understand this tool is for educational purposes only and does not constitute professional tax advice.",
+        value=st.session_state.disclaimer_acknowledged,
+        key="disclaimer_checkbox"
+    )
+    st.session_state.disclaimer_acknowledged = acknowledged
 
 # Check RAG status
 db = load_vector_db()
@@ -549,6 +750,10 @@ else:
 # Sidebar
 # ==========================================
 with st.sidebar:
+    # Privacy Notice at top
+    with st.expander("🔒 Privacy & Data Notice", expanded=False):
+        st.markdown(PRIVACY_NOTICE)
+    
     st.header("👤 Your Tax Profile")
     
     user_type = st.radio(
@@ -589,6 +794,14 @@ with st.sidebar:
     # ==========================================
     st.subheader("📎 Upload Documents")
     
+    # Upload Warning
+    st.markdown("""
+    <div class="upload-warning">
+    ⚠️ <strong>Before uploading:</strong> We recommend using documents with 
+    sample/redacted SSNs. Any detected sensitive data will be automatically masked.
+    </div>
+    """, unsafe_allow_html=True)
+    
     uploaded_doc = st.file_uploader(
         "Upload tax document (PDF/DOCX/TXT)",
         type=["pdf", "docx", "txt"],
@@ -596,14 +809,20 @@ with st.sidebar:
     )
     
     if uploaded_doc:
-        with st.spinner("📄 Extracting text..."):
-            extracted_text = extract_text_from_file(uploaded_doc)
+        with st.spinner("📄 Extracting & securing text..."):
+            extracted_text, pii_counts, pii_warning = extract_text_from_file(uploaded_doc)
             st.session_state.uploaded_doc_text = extracted_text
             st.session_state.uploaded_doc_name = uploaded_doc.name
         
         st.success(f"✅ {uploaded_doc.name}")
         
-        with st.expander("📄 Preview", expanded=False):
+        # Show PII warning if detected
+        if pii_counts:
+            st.warning(f"🔒 Masked {sum(pii_counts.values())} sensitive item(s)")
+            with st.expander("View PII Details", expanded=False):
+                st.markdown(pii_warning)
+        
+        with st.expander("📄 Preview (Masked)", expanded=False):
             st.text_area("Content", extracted_text[:500] + "...", height=100, disabled=True)
         
         if st.button("🗑️ Clear Doc", key="clear_doc"):
@@ -621,14 +840,20 @@ with st.sidebar:
     if uploaded_img:
         st.image(uploaded_img, caption="Uploaded", use_container_width=True)
         
-        with st.spinner("🔍 Running OCR..."):
-            ocr_text = extract_text_from_image(uploaded_img)
+        with st.spinner("🔍 Running OCR & securing data..."):
+            ocr_text, pii_counts, pii_warning = extract_text_from_image(uploaded_img)
             st.session_state.uploaded_img_text = ocr_text
             st.session_state.uploaded_img_name = uploaded_img.name
         
         st.success("✅ OCR completed")
         
-        with st.expander("🔍 OCR Result", expanded=False):
+        # Show PII warning if detected
+        if pii_counts:
+            st.warning(f"🔒 Masked {sum(pii_counts.values())} sensitive item(s)")
+            with st.expander("View PII Details", expanded=False):
+                st.markdown(pii_warning)
+        
+        with st.expander("🔍 OCR Result (Masked)", expanded=False):
             st.text_area("Extracted", ocr_text[:500], height=100, disabled=True)
         
         if st.button("🗑️ Clear Image", key="clear_img"):
@@ -698,6 +923,10 @@ for message in st.session_state.messages:
 prompt = st.chat_input("Tell me how I can help with your taxes today...")
 
 if prompt:
+    # Check for PII in user input and mask it
+    detected_pii = PIIHandler.detect_pii(prompt)
+    masked_prompt, pii_counts = PIIHandler.mask_pii(prompt)
+    
     # Build context with uploaded documents
     context_parts = []
     
@@ -707,7 +936,7 @@ if prompt:
     if st.session_state.get('uploaded_img_text'):
         context_parts.append(f"[OCR from: {st.session_state.uploaded_img_name}]\n{st.session_state.uploaded_img_text}")
     
-    full_prompt = "\n\n".join(context_parts) + f"\n\nUser Question: {prompt}" if context_parts else prompt
+    full_prompt = "\n\n".join(context_parts) + f"\n\nUser Question: {masked_prompt}" if context_parts else masked_prompt
     
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -716,6 +945,15 @@ if prompt:
         st.markdown(prompt)
         if context_parts:
             st.caption("📎 *Using uploaded documents*")
+        
+        # Show PII warning if detected
+        if pii_counts:
+            st.markdown(f"""
+            <div class="pii-warning">
+            🔒 <strong>Privacy Protection:</strong> We detected and masked {sum(pii_counts.values())} 
+            sensitive item(s) in your message before processing.
+            </div>
+            """, unsafe_allow_html=True)
     
     # Get RAG-enhanced system prompt
     system_prompt = get_intake_system_prompt(st.session_state.user_profile)
