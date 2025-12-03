@@ -107,7 +107,7 @@ st.markdown("""
     font-size: 0.9em;
 }
 .upload-warning {
-    background-color: #fff3cd;
+    background-color: #;
     border: 1px solid #ffc107;
     border-radius: 5px;
     padding: 8px 12px;

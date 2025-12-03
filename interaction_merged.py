@@ -15,6 +15,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 from tax_brain_merged import TaxOrchestrator, UserProfile, PIIHandler, LEGAL_DISCLAIMER, PRIVACY_NOTICE
+from session_memory import SessionMemoryManager, UserSession, get_memory_manager
 
 # OCR imports
 try:
@@ -235,6 +236,73 @@ def render_sidebar():
         
         st.divider()
         
+        # ==========================================
+        # Session Management Section
+        # ==========================================
+        st.subheader("💾 Session Management")
+        
+        # Show session ID
+        if 'session_id' in st.session_state:
+            st.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
+            
+            # Session summary
+            if 'user_session' in st.session_state:
+                session = st.session_state.user_session
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Profile", f"{session.profile_completion:.0f}%")
+                with col2:
+                    st.metric("Checklist", f"{session.checklist_completion:.0f}%")
+            
+            # Copy session link
+            session_url = f"?session_id={st.session_state.session_id}"
+            st.caption(f"🔗 Resume link: Add `{session_url}` to URL")
+            
+            # Session actions
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("📋 Copy ID", key="copy_session_id", use_container_width=True):
+                    st.code(st.session_state.session_id, language=None)
+            
+            with col2:
+                if st.button("🗑️ Clear Session", key="clear_session", use_container_width=True):
+                    # Delete from memory
+                    memory_manager = load_memory_manager()
+                    memory_manager.delete_session(st.session_state.session_id)
+                    
+                    # Clear session state
+                    for key in list(st.session_state.keys()):
+                        del st.session_state[key]
+                    
+                    st.rerun()
+            
+            # Load existing session
+            with st.expander("🔄 Load Previous Session", expanded=False):
+                load_session_id = st.text_input(
+                    "Enter Session ID:",
+                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                    key="load_session_input"
+                )
+                
+                if st.button("Load Session", key="load_session_btn"):
+                    if load_session_id:
+                        memory_manager = load_memory_manager()
+                        loaded_session = memory_manager.get_session(load_session_id)
+                        
+                        if loaded_session:
+                            # Clear current state
+                            st.session_state.session_id = load_session_id
+                            st.session_state.user_session = loaded_session
+                            st.session_state.session_loaded = False  # Force reload
+                            st.success("✅ Session loaded!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Session not found")
+        
+        st.divider()
+        
         # Checklist Display
         st.subheader("📋 Tax Filing Checklist")
         
@@ -427,6 +495,24 @@ def main():
         if not st.session_state.api_key:
             st.stop()
     
+    # ==========================================
+    # Initialize Session Memory
+    # ==========================================
+    memory_manager = load_memory_manager()
+    
+    # Get or create session ID
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = get_or_create_session_id()
+    
+    # Load session from memory
+    if 'session_loaded' not in st.session_state:
+        session = load_session_from_memory(memory_manager, st.session_state.session_id)
+        st.session_state.user_session = session
+        
+        # Load existing data from memory
+        load_session_state_from_memory(memory_manager, session)
+        st.session_state.session_loaded = True
+    
     # Initialize system
     if 'orchestrator' not in st.session_state:
         with st.spinner("🔧 Initializing AI Tax Assistant..."):
@@ -537,6 +623,17 @@ def main():
         
         st.session_state.messages.append({"role": "assistant", "content": answer})
         
+        # ==========================================
+        # Sync to Persistent Memory
+        # ==========================================
+        sync_session_to_memory(
+            memory_manager,
+            st.session_state.user_session,
+            st.session_state.user_profile,
+            st.session_state.checklist,
+            st.session_state.messages
+        )
+        
         # Update checklist
         with st.status("📋 Updating checklist...", expanded=False) as checklist_status:
             try:
@@ -548,6 +645,15 @@ def main():
                 checklist_status.update(label="✅ Checklist updated!", state="complete")
             except Exception as e:
                 checklist_status.update(label="⚠️ Checklist update failed", state="error")
+        
+        # Final sync to memory after checklist update
+        sync_session_to_memory(
+            memory_manager,
+            st.session_state.user_session,
+            st.session_state.user_profile,
+            st.session_state.checklist,
+            st.session_state.messages
+        )
         
         st.rerun()
     
