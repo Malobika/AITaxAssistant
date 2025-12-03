@@ -10,3 +10,11 @@ easyocr
 torch
 openai
 pdfplumber
+
+
+langchain-core
+langchain-huggingface
+
+pysqlite3-binary
+
+PyPDF2
