@@ -17,6 +17,14 @@ from typing import Dict, List, Tuple
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
+# Session Memory imports
+try:
+    from session_memory import SessionMemoryManager, UserSession
+    MEMORY_AVAILABLE = True
+except ImportError:
+    MEMORY_AVAILABLE = False
+    print("⚠️ Session memory not available. Install session_memory.py for persistence.")
+
 # OCR imports
 try:
     import easyocr
@@ -107,7 +115,7 @@ st.markdown("""
     font-size: 0.9em;
 }
 .upload-warning {
-    background-color: #;
+    background-color: #fff3cd;
     border: 1px solid #ffc107;
     border-radius: 5px;
     padding: 8px 12px;
@@ -229,6 +237,94 @@ def load_ocr():
     if OCR_AVAILABLE:
         return easyocr.Reader(["en"], gpu=False)
     return None
+
+@st.cache_resource
+def load_memory_manager():
+    """Load session memory manager"""
+    if MEMORY_AVAILABLE:
+        return SessionMemoryManager()
+    return None
+
+# ==========================================
+# Session Management Functions
+# ==========================================
+def get_or_create_session_id() -> str:
+    """Get existing session ID or create new one"""
+    query_params = st.query_params
+    session_id = query_params.get("session_id", None)
+    
+    if not session_id and 'session_id' in st.session_state:
+        session_id = st.session_state.session_id
+    
+    if not session_id:
+        import uuid
+        session_id = str(uuid.uuid4())
+    
+    return session_id
+
+def load_session_from_memory(memory_manager, session_id: str):
+    """Load session from persistent memory"""
+    if not memory_manager:
+        return None
+    
+    session = memory_manager.get_session(session_id)
+    
+    if not session:
+        session = memory_manager.create_session()
+        session.session_id = session_id
+        memory_manager.save_session(session)
+    
+    return session
+
+def sync_session_to_memory(memory_manager, session, user_profile: dict, 
+                           checklist: list, messages: list):
+    """Sync current session state to persistent memory"""
+    if not memory_manager or not session:
+        return
+    
+    # Update session with profile data
+    session.citizenship_status = user_profile.get('employment_status')
+    session.student_status = "Student" if user_profile.get('employment_status') == "Student" else "Working"
+    
+    # Calculate completions
+    profile_fields = [session.citizenship_status, session.student_status]
+    session.profile_completion = (sum(1 for f in profile_fields if f) / 2) * 100
+    
+    if checklist:
+        session.checklist_completion = sum(s.get('completion', 0) for s in checklist) / len(checklist)
+    
+    # Save to memory
+    memory_manager.save_session(session)
+    memory_manager.save_checklist(session.session_id, checklist)
+    
+    # Save new messages
+    existing_messages = memory_manager.get_conversation_history(session.session_id)
+    existing_count = len(existing_messages)
+    
+    for msg in messages[existing_count:]:
+        memory_manager.save_message(
+            session.session_id,
+            msg.get('role', 'user'),
+            msg.get('content', '')
+        )
+
+def load_session_state_from_memory(memory_manager, session):
+    """Load session state from persistent memory"""
+    if not memory_manager or not session:
+        return
+    
+    # Load conversation history
+    messages = memory_manager.get_conversation_history(session.session_id)
+    if messages:
+        st.session_state.messages = [
+            {"role": msg['role'], "content": msg['content'].split(": ", 1)[-1] if ": " in msg['content'] else msg['content']}
+            for msg in messages
+        ]
+    
+    # Load checklist
+    checklist = memory_manager.get_checklist(session.session_id)
+    if checklist:
+        st.session_state.checklist = checklist
 
 # ==========================================
 # RAG Search Functions
@@ -747,6 +843,25 @@ else:
     st.warning("⚠️ RAG Database not found. Visual guides will use general knowledge only.")
 
 # ==========================================
+# Initialize Session Memory
+# ==========================================
+memory_manager = load_memory_manager()
+
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = get_or_create_session_id()
+
+if 'session_loaded' not in st.session_state and memory_manager:
+    session = load_session_from_memory(memory_manager, st.session_state.session_id)
+    st.session_state.user_session = session
+    load_session_state_from_memory(memory_manager, session)
+    st.session_state.session_loaded = True
+
+if memory_manager:
+    st.success("✅ Session Memory Connected", icon="💾")
+else:
+    st.info("ℹ️ Session memory not available. Progress won't persist across sessions.")
+
+# ==========================================
 # Sidebar
 # ==========================================
 with st.sidebar:
@@ -864,7 +979,62 @@ with st.sidebar:
     st.divider()
     
     # ==========================================
-    # Live Checklist (with completion %)
+    # Session Management Section
+    # ==========================================
+    st.subheader("💾 Session Management")
+    
+    if 'session_id' in st.session_state:
+        st.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
+        
+        # Session metrics
+        if 'user_session' in st.session_state and st.session_state.user_session:
+            session = st.session_state.user_session
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Profile", f"{getattr(session, 'profile_completion', 0):.0f}%")
+            with col2:
+                st.metric("Checklist", f"{getattr(session, 'checklist_completion', 0):.0f}%")
+        
+        st.caption(f"🔗 Resume: Add `?session_id={st.session_state.session_id}` to URL")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📋 Copy ID", key="copy_session", use_container_width=True):
+                st.code(st.session_state.session_id, language=None)
+        
+        with col2:
+            if st.button("🗑️ Clear", key="clear_session", use_container_width=True):
+                if memory_manager:
+                    memory_manager.delete_session(st.session_state.session_id)
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()
+        
+        # Load previous session
+        with st.expander("🔄 Load Previous Session", expanded=False):
+            load_session_id = st.text_input(
+                "Enter Session ID:",
+                placeholder="xxxxxxxx-xxxx-...",
+                key="load_session_input"
+            )
+            
+            if st.button("Load", key="load_session_btn"):
+                if load_session_id and memory_manager:
+                    loaded = memory_manager.get_session(load_session_id)
+                    if loaded:
+                        st.session_state.session_id = load_session_id
+                        st.session_state.user_session = loaded
+                        st.session_state.session_loaded = False
+                        st.success("✅ Session loaded!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Session not found")
+    
+    st.divider()
+    
+    # ==========================================
+    # Live Checklist
     # ==========================================
     st.header("🧾 Live Tax-filing Checklist")
     
@@ -989,6 +1159,16 @@ if prompt:
             st.session_state.uploaded_img_name = None
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
+    
+    # Sync to persistent memory
+    if memory_manager and 'user_session' in st.session_state:
+        sync_session_to_memory(
+            memory_manager,
+            st.session_state.user_session,
+            st.session_state.user_profile,
+            st.session_state.checklist,
+            st.session_state.messages
+        )
     
     # Update checklist
     with st.status("📋 Updating checklist...", expanded=False):
