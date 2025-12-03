@@ -15,7 +15,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 from tax_brain_merged import TaxOrchestrator, UserProfile, PIIHandler, LEGAL_DISCLAIMER, PRIVACY_NOTICE
-from session_memory import SessionMemoryManager, UserSession, get_memory_manager
+from sessionmemory import SessionMemoryManager, UserSession, get_memory_manager
 
 # OCR imports
 try:

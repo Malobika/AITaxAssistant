@@ -19,7 +19,7 @@ from langchain_community.vectorstores import Chroma
 
 # Session Memory imports
 try:
-    from session_memory import SessionMemoryManager, UserSession
+    from sessionmemory import SessionMemoryManager, UserSession
     MEMORY_AVAILABLE = True
 except ImportError:
     MEMORY_AVAILABLE = False
