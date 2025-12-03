@@ -21,110 +21,89 @@ if "user_profile" not in st.session_state:
 if "visual_indices" not in st.session_state:
     st.session_state.visual_indices = {}
 
-# ---------------------------------------------------------
-# 🧾 Visual snippet memory (incremental / RAG-friendly)
-# ---------------------------------------------------------
-# In the future, each snippet could come from a RAG chunk.
-VISUAL_SNIPPETS = {
-    "w2_to_1040nr": [
-        # Step 1: overall + Box 1
-        """
-# ---------------------------------------------------------
-#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 1)
-#   Focus: layout + Box 1 (wages)
-# ---------------------------------------------------------
-#  W-2 Box 1 : Wages, tips, other compensation
-#  → Form 1040-NR Line 1a
-#    ("Total amount from Form(s) W-2, box 1")
-# ---------------------------------------------------------
-        """.strip("\n"),
+import streamlit as st
+from openai import OpenAI
 
-        # Step 2: Box 2
-        """
-# ---------------------------------------------------------
-#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 2)
-#   Focus: Box 2 (federal tax withheld)
-# ---------------------------------------------------------
-#  W-2 Box 2 : Federal income tax withheld
-#  → Form 1040-NR Line 25a
-#    ("Federal income tax withheld from Form(s) W-2")
-# ---------------------------------------------------------
-        """.strip("\n"),
+client = OpenAI()
 
-        # Step 3: Social Security wages/tax
-        """
-# ---------------------------------------------------------
-#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 3)
-#   Focus: Boxes 3–4 (Social Security)
-# ---------------------------------------------------------
-#  W-2 Box 3 : Social security wages
-#  W-2 Box 4 : Social security tax withheld
-#  → Not entered directly on Form 1040-NR, but useful to
-#    verify your Social Security records and to check for
-#    excess withholding (Form 843 in special cases).
-# ---------------------------------------------------------
-        """.strip("\n"),
+# Store generated visual snippets per topic
+if "visual_snippets" not in st.session_state:
+    # { topic: [snippet_1, snippet_2, ...] }
+    st.session_state.visual_snippets = {}
 
-        # Step 4: Medicare wages/tax
-        """
-# ---------------------------------------------------------
-#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 4)
-#   Focus: Boxes 5–6 (Medicare)
-# ---------------------------------------------------------
-#  W-2 Box 5 : Medicare wages and tips
-#  W-2 Box 6 : Medicare tax withheld
-#  → Not entered directly on Form 1040-NR, but used to
-#    verify Medicare withholding amounts.
-# ---------------------------------------------------------
-        """.strip("\n"),
 
-        # Step 5: Box 12, 14, and "other" info
-        """
-# ---------------------------------------------------------
-#   W-2 → FORM 1040-NR VISUAL GUIDE (STEP 5)
-#   Focus: Box 12, Box 14, and "other" info
-# ---------------------------------------------------------
-#  W-2 Box 12 : Codes (D, E, G, etc. for retirement/benefits)
-#    → May affect other forms (e.g., Form 8880, retirement
-#      contributions) but not a single 1040-NR line by itself.
-#
-#  W-2 Box 14 : "Other" information (state tax, union dues, etc.)
-#    → Often relevant for state returns or recordkeeping.
-# ---------------------------------------------------------
-        """.strip("\n"),
-    ]
-}
+def generate_visual_snippet(topic: str) -> str:
+    """
+    Ask the ChatGPT agent (chat completions) to generate the NEXT visual snippet
+    for a given topic.
+    """
+    existing_snippets = st.session_state.visual_snippets.get(topic, [])
+    step_number = len(existing_snippets) + 1
+
+    # Small slice of context
+    recent_messages = st.session_state.messages[-8:]
+    recent_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in recent_messages
+    )
+
+    user_profile_str = ", ".join(
+        f"{k}={v}" for k, v in st.session_state.user_profile.items()
+    )
+
+    system_prompt = (
+        "You are a tax-focused visualization assistant that explains things in "
+        "short, step-by-step, code-style text blocks. Each response should look "
+        "like a mini 'visual guide' with comments and separators, suitable for "
+        "a monospaced font."
+    )
+
+    user_prompt = f"""
+Create the NEXT step of a visual guide for the topic: "{topic}".
+
+- Step number: {step_number}
+- User profile (if helpful): {user_profile_str or "unknown"}
+- Recent conversation (for context, if relevant):
+{recent_text or "[no recent messages]"}
+
+Requirements:
+- Output a SINGLE code-style text block (no backticks, just plain text).
+- Start with a header comment bar and step label, for example:
+  # ---------------------------------------------------------
+  #   <TOPIC NAME> VISUAL GUIDE (STEP {step_number})
+  #   Focus: <short focus>
+  # ---------------------------------------------------------
+- Then add 3–8 lines of concise explanation, using comments (#) and arrows (→)
+  to show where values go or how the user should think about the step.
+- Keep it focused on THIS step only. Assume previous steps already appeared above.
+- Keep it under ~120 words.
+"""
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",  # or whatever model you prefer
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.4,
+    )
+
+    snippet = completion.choices[0].message.content.strip()
+    return snippet
 
 
 def get_next_visual_snippets(topic: str):
     """
-    Return all snippets up to the current index for a topic
-    and advance the index by 1 (until the end).
-    This is a simple stand-in for a future RAG-based retriever.
+    Generate the next visual snippet for `topic` via ChatGPT and
+    return ALL snippets accumulated so far for that topic.
     """
-    steps = VISUAL_SNIPPETS.get(topic, [])
-    if not steps:
-        return []
+    next_snippet = generate_visual_snippet(topic)
 
-    current_idx = st.session_state.visual_indices.get(topic, 0)
+    if topic not in st.session_state.visual_snippets:
+        st.session_state.visual_snippets[topic] = []
 
-    # Clamp index
-    if current_idx < 0:
-        current_idx = 0
-    if current_idx >= len(steps):
-        current_idx = len(steps) - 1
+    st.session_state.visual_snippets[topic].append(next_snippet)
 
-    # Snippets to show: from 0 .. current_idx
-    snippets_to_show = steps[: current_idx + 1]
-
-    # Advance index for next time (but don't go past last)
-    if current_idx < len(steps) - 1:
-        st.session_state.visual_indices[topic] = current_idx + 1
-    else:
-        st.session_state.visual_indices[topic] = current_idx  # stay at last
-
-    return snippets_to_show
-
+    return st.session_state.visual_snippets[topic]
 
 # ---------------------------------------------------------
 # 🧠 Checklist Agent helper
