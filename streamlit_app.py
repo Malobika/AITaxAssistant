@@ -21,11 +21,6 @@ if "user_profile" not in st.session_state:
 if "visual_indices" not in st.session_state:
     st.session_state.visual_indices = {}
 
-import streamlit as st
-from openai import OpenAI
-
-client = OpenAI()
-
 # Store generated visual snippets per topic
 if "visual_snippets" not in st.session_state:
     # { topic: [snippet_1, snippet_2, ...] }
