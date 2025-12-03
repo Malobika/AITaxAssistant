@@ -26,6 +26,71 @@ if "visual_snippets" not in st.session_state:
     # { topic: [snippet_1, snippet_2, ...] }
     st.session_state.visual_snippets = {}
 
+if "current_visual_topic" not in st.session_state:
+    st.session_state.current_visual_topic = None
+
+
+def infer_visual_topic() -> str:
+    """
+    Use ChatGPT to infer a stable topic key
+    from the recent conversation and user profile.
+
+    Returns a machine-friendly slug like:
+      - "w2_to_1040nr"
+      - "1098t_to_1040nr"
+      - "generic_tax_visual"
+    """
+    recent_messages = st.session_state.messages[-10:]
+    recent_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in recent_messages
+    )
+
+    user_profile_str = ", ".join(
+        f"{k}={v}" for k, v in st.session_state.user_profile.items()
+    )
+
+    system_prompt = (
+        "You are a routing assistant that chooses a single short topic key "
+        "for a tax visualization component. "
+        "Your ONLY job is to output a machine-friendly slug for the topic."
+    )
+
+    user_prompt = f"""
+Conversation so far:
+{recent_text or "[no recent messages]"}
+
+User profile (may help you guess the form type): {user_profile_str or "unknown"}
+
+Decide what visual mapping topic is most relevant RIGHT NOW.
+
+Examples of valid topic keys (just examples):
+- w2_to_1040nr
+- w2_box12_to_1040nr
+- 1098t_to_1040nr
+- 1099int_to_1040nr
+- schedule1_adjustments
+- generic_tax_visual
+
+Rules:
+- Respond with EXACTLY ONE topic key.
+- Use only lowercase letters, digits, and underscores.
+- No explanation, no extra text.
+- If you're not sure, default to: w2_to_1040nr
+"""
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+    )
+
+    topic_key = completion.choices[0].message.content.strip()
+    if not topic_key:
+        topic_key = "w2_to_1040nr"
+    return topic_key
 
 def generate_visual_snippet(topic: str) -> str:
     """
@@ -378,30 +443,40 @@ if client is not None:
 # ---------------------------------------------------------
 # 🔘 Incremental visual help (can be W-2 or other topics)
 # ---------------------------------------------------------
-st.markdown("### Need more visual help with how a form box maps to 1040-NR?")
-
-# For now we hardcode W-2, but this 'topic' could later be
-# any key that comes from a RAG result.
-topic = "w2_to_1040nr"
+st.markdown("### Need more visual help with how a form box maps to your return?")
 
 col_v1, col_v2 = st.columns([1, 2])
+
 with col_v1:
-    if st.button("🧾 Show next W-2 → 1040-NR step"):
-        # This just advances the counter in memory.
-        # No RAG yet, just list-based snippets.
-        snippets = get_next_visual_snippets(topic)
-        st.session_state[f"visual_snippets_{topic}"] = snippets
+    if st.button("🧾 Show next step"):
+        # If we don't have a topic yet (or you want to re-evaluate each click),
+        # ask GPT to infer the most relevant topic from the conversation.
+        if st.session_state.current_visual_topic is None:
+            st.session_state.current_visual_topic = infer_visual_topic()
+
+        topic = st.session_state.current_visual_topic
+
+        # Generate and store the next visual snippet for that topic
+        get_next_visual_snippets(topic)
 
 with col_v2:
-    # Render whatever we have so far for this topic
-    snippets = st.session_state.get(f"visual_snippets_{topic}", [])
-    if snippets:
-        for snip in snippets:
-            st.text(snip)
+    topic = st.session_state.current_visual_topic
+    if topic:
+        topic_snippets = st.session_state.visual_snippets.get(topic, [])
+        if topic_snippets:
+            st.caption(f"Visual topic: `{topic}`")
+            for snip in topic_snippets:
+                st.code(snip, language="markdown")
+        else:
+            st.caption(
+                "Topic detected, but no visual steps yet. "
+                "Click the button to see the first snippet."
+            )
     else:
         st.caption(
-            "Click the button to see the first W-2 → 1040-NR mapping snippet. "
-            "Each click reveals the next column/box."
+            "Click the button to see the first mapping snippet. "
+            "The assistant will detect which form/topic you're working on "
+            "and then reveal each step."
         )
 
 # ---------------------------------------------------------
