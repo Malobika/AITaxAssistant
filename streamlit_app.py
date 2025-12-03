@@ -1,284 +1,455 @@
+# Fix sqlite3 issue (must be at the very top)
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except (ImportError, KeyError):
+    pass
+
 import streamlit as st
 from openai import OpenAI
 import os
 import json
 
-st.set_page_config(page_title="AI Tax Assistant", page_icon="💬")
+# RAG imports
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 
-# ---------------------------------------------------------
-# 🔁 Session state initialization
-# ---------------------------------------------------------
+# OCR imports
+try:
+    import easyocr
+    from PIL import Image
+    import numpy as np
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# Document processing imports
+try:
+    from PyPDF2 import PdfReader
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+# ==========================================
+# Configuration
+# ==========================================
+DB_DIRECTORY = "federal_tax_vector_db"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+COLLECTION_NAME = "federal_tax_documents"
+
+st.set_page_config(page_title="AI Tax Assistant", page_icon="💬", layout="wide")
+
+# ==========================================
+# RAG Setup (Cached)
+# ==========================================
+@st.cache_resource
+def load_vector_db():
+    """Load ChromaDB vector database"""
+    if os.path.exists(DB_DIRECTORY):
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        db = Chroma(
+            persist_directory=DB_DIRECTORY,
+            embedding_function=embeddings,
+            collection_name=COLLECTION_NAME
+        )
+        return db
+    return None
+
+@st.cache_resource
+def load_ocr():
+    """Load OCR model"""
+    if OCR_AVAILABLE:
+        return easyocr.Reader(["en"], gpu=False)
+    return None
+
+# ==========================================
+# RAG Search Functions
+# ==========================================
+def rag_search(query: str, k: int = 3, doc_type: str = "all") -> str:
+    """Search ChromaDB for relevant tax information"""
+    db = load_vector_db()
+    if not db:
+        return "Tax database is not available."
+    
+    try:
+        filter_dict = {"doc_type": doc_type} if doc_type != "all" else None
+        results = db.similarity_search(query, k=k, filter=filter_dict)
+        
+        if not results:
+            return "No relevant information found in the tax database."
+        
+        response = ""
+        for i, doc in enumerate(results, 1):
+            source = doc.metadata.get('source_file', 'Unknown')
+            form = doc.metadata.get('form_number', 'N/A')
+            content = doc.page_content[:400]
+            response += f"**Source {i}** - {source} (Form {form}):\n{content}...\n\n"
+        
+        return response
+    except Exception as e:
+        return f"Error searching database: {str(e)}"
+
+def rag_search_for_visual(source_form: str, target_form: str, step: int) -> str:
+    """Search for specific form mapping information for visual generation"""
+    db = load_vector_db()
+    if not db:
+        return ""
+    
+    step_queries = {
+        1: f"{source_form} Box 1 wages compensation {target_form} line",
+        2: f"{source_form} Box 2 federal income tax withheld {target_form}",
+        3: f"{source_form} Box 3 4 Social Security wages tax {target_form}",
+        4: f"{source_form} Box 5 6 Medicare wages tax {target_form}",
+        5: f"{source_form} Box 12 14 codes other information {target_form}",
+    }
+    
+    query = step_queries.get(step, f"{source_form} to {target_form} mapping step {step}")
+    
+    try:
+        results = db.similarity_search(query, k=2)
+        if results:
+            return "\n\n".join([
+                f"IRS Reference ({doc.metadata.get('source_file', 'Unknown')}):\n{doc.page_content[:300]}"
+                for doc in results
+            ])
+    except Exception as e:
+        print(f"RAG search error: {e}")
+    
+    return ""
+
+# ==========================================
+# Document Text Extraction
+# ==========================================
+def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded document"""
+    file_type = uploaded_file.type
+    text = ""
+    
+    try:
+        if file_type == "text/plain":
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+        elif file_type == "application/pdf":
+            if not PDF_AVAILABLE:
+                return "❌ PDF support not installed. Run: pip install PyPDF2"
+            reader = PdfReader(uploaded_file)
+            text = "\n".join([page.extract_text() or "" for page in reader.pages[:10]])
+        elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            if not DOCX_AVAILABLE:
+                return "❌ DOCX support not installed. Run: pip install python-docx"
+            doc = Document(uploaded_file)
+            text = "\n".join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        text = f"❌ Error extracting text: {str(e)}"
+    
+    return text
+
+def extract_text_from_image(uploaded_image):
+    """Extract text from image using OCR"""
+    if not OCR_AVAILABLE:
+        return "❌ OCR not installed. Run: pip install easyocr pillow"
+    
+    try:
+        ocr_reader = load_ocr()
+        image = Image.open(uploaded_image)
+        image_np = np.array(image)
+        results = ocr_reader.readtext(image_np)
+        return "\n".join([res[1] for res in results])
+    except Exception as e:
+        return f"❌ OCR Error: {str(e)}"
+
+# ==========================================
+# Session State Initialization
+# ==========================================
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # chat history for Intake Agent
+    st.session_state.messages = []
 
 if "checklist" not in st.session_state:
-    st.session_state.checklist = []  # hierarchical checklist from Checklist Agent
+    st.session_state.checklist = []
 
 if "user_profile" not in st.session_state:
-    st.session_state.user_profile = {}  # profile (student/working, visa, W2 status)
+    st.session_state.user_profile = {}
 
-# Memory: which snippet index per topic (RAG-like pointer, but simple counter)
 if "visual_indices" not in st.session_state:
     st.session_state.visual_indices = {}
 
-# Store generated visual snippets per topic
 if "visual_snippets" not in st.session_state:
-    # { topic: [snippet_1, snippet_2, ...] }
     st.session_state.visual_snippets = {}
 
 if "current_visual_topic" not in st.session_state:
     st.session_state.current_visual_topic = None
 
+# NEW: Document upload state
+if "uploaded_doc_text" not in st.session_state:
+    st.session_state.uploaded_doc_text = None
 
-def infer_visual_topic() -> str:
-    """
-    Use ChatGPT to infer a stable topic key
-    from the recent conversation and user profile.
+if "uploaded_doc_name" not in st.session_state:
+    st.session_state.uploaded_doc_name = None
 
-    Returns a machine-friendly slug like:
-      - "w2_to_1040nr"
-      - "1098t_to_1040nr"
-      - "generic_tax_visual"
-    """
+if "uploaded_img_text" not in st.session_state:
+    st.session_state.uploaded_img_text = None
+
+if "uploaded_img_name" not in st.session_state:
+    st.session_state.uploaded_img_name = None
+
+if "search_result" not in st.session_state:
+    st.session_state.search_result = None
+
+# ==========================================
+# Visual Topic Inference (RAG-Enhanced)
+# ==========================================
+def infer_visual_topic(client: OpenAI) -> str:
+    """Infer the most relevant visual topic from conversation using RAG context"""
     recent_messages = st.session_state.messages[-10:]
     recent_text = "\n".join(
         f"{m['role']}: {m['content']}" for m in recent_messages
     )
-
+    
     user_profile_str = ", ".join(
         f"{k}={v}" for k, v in st.session_state.user_profile.items()
     )
+    
+    # Get RAG context to help with topic inference
+    rag_context = ""
+    if recent_text:
+        rag_context = rag_search(recent_text[:200], k=1)
+    
+    system_prompt = """You are a routing assistant that chooses a single short topic key for a tax visualization component.
+Your ONLY job is to output a machine-friendly slug for the topic.
 
-    system_prompt = (
-        "You are a routing assistant that chooses a single short topic key "
-        "for a tax visualization component. "
-        "Your ONLY job is to output a machine-friendly slug for the topic."
-    )
+Available topics:
+- w2_to_1040nr (W-2 to Form 1040-NR for nonresidents/F-1 students)
+- w2_to_1040 (W-2 to Form 1040 for US residents)
+- 1098t_to_1040nr (Form 1098-T tuition to 1040-NR)
+- 1098t_to_1040 (Form 1098-T to Form 1040)
+- 1099int_to_1040 (1099-INT interest income)
+- 1099nec_to_schedule_c (1099-NEC self-employment)
+- schedule1_adjustments (Schedule 1 adjustments)
+- generic_tax_visual (general guidance)
+
+Rules:
+- International students/F-1 visa → use 1040nr variants
+- US citizens/residents → use 1040 variants
+- Students with tuition → 1098t topics
+- Self-employed → 1099nec or schedule_c
+- Respond with EXACTLY ONE topic key, nothing else."""
 
     user_prompt = f"""
 Conversation so far:
 {recent_text or "[no recent messages]"}
 
-User profile (may help you guess the form type): {user_profile_str or "unknown"}
+User profile: {user_profile_str or "unknown"}
 
-Decide what visual mapping topic is most relevant RIGHT NOW.
+{f"Relevant IRS context: {rag_context[:200]}" if rag_context else ""}
 
-Examples of valid topic keys (just examples):
-- w2_to_1040nr
-- w2_box12_to_1040nr
-- 1098t_to_1040nr
-- 1099int_to_1040nr
-- schedule1_adjustments
-- generic_tax_visual
+Output the most relevant topic key:"""
 
-Rules:
-- Respond with EXACTLY ONE topic key.
-- Use only lowercase letters, digits, and underscores.
-- No explanation, no extra text.
-- If you're not sure, default to: w2_to_1040nr
-"""
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+        )
+        topic_key = completion.choices[0].message.content.strip().lower()
+        
+        valid_topics = [
+            "w2_to_1040nr", "w2_to_1040", "1098t_to_1040nr", "1098t_to_1040",
+            "1099int_to_1040", "1099nec_to_schedule_c", "schedule1_adjustments",
+            "generic_tax_visual"
+        ]
+        
+        if topic_key not in valid_topics:
+            topic_key = "w2_to_1040nr"
+        return topic_key
+    except Exception as e:
+        print(f"Topic inference error: {e}")
+        return "w2_to_1040nr"
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-    )
+def parse_topic(topic: str) -> dict:
+    """Parse topic key into source and target forms"""
+    mappings = {
+        "w2_to_1040nr": {"source": "W-2", "target": "1040-NR"},
+        "w2_to_1040": {"source": "W-2", "target": "1040"},
+        "1098t_to_1040nr": {"source": "1098-T", "target": "1040-NR"},
+        "1098t_to_1040": {"source": "1098-T", "target": "1040"},
+        "1099int_to_1040": {"source": "1099-INT", "target": "1040"},
+        "1099nec_to_schedule_c": {"source": "1099-NEC", "target": "Schedule C"},
+        "schedule1_adjustments": {"source": "Various", "target": "Schedule 1"},
+        "generic_tax_visual": {"source": "General", "target": "Tax Return"},
+    }
+    return mappings.get(topic, {"source": "W-2", "target": "1040-NR"})
 
-    topic_key = completion.choices[0].message.content.strip()
-    if not topic_key:
-        topic_key = "w2_to_1040nr"
-    return topic_key
-
-def generate_visual_snippet(topic: str) -> str:
-    """
-    Ask the ChatGPT agent (chat completions) to generate the NEXT visual snippet
-    for a given topic.
-    """
+# ==========================================
+# Visual Snippet Generation (RAG-Enhanced)
+# ==========================================
+def generate_visual_snippet(client: OpenAI, topic: str) -> str:
+    """Generate the NEXT visual snippet using RAG for accuracy"""
     existing_snippets = st.session_state.visual_snippets.get(topic, [])
     step_number = len(existing_snippets) + 1
-
-    # Small slice of context
+    
+    # Parse topic
+    forms = parse_topic(topic)
+    source_form = forms["source"]
+    target_form = forms["target"]
+    
+    # Get RAG context for this specific step
+    rag_context = rag_search_for_visual(source_form, target_form, step_number)
+    
     recent_messages = st.session_state.messages[-8:]
     recent_text = "\n".join(
         f"{m['role']}: {m['content']}" for m in recent_messages
     )
-
+    
     user_profile_str = ", ".join(
         f"{k}={v}" for k, v in st.session_state.user_profile.items()
     )
 
-    system_prompt = (
-        "You are a tax-focused visualization assistant that explains things in "
-        "short, step-by-step, code-style text blocks. Each response should look "
-        "like a mini 'visual guide' with comments and separators, suitable for "
-        "a monospaced font."
-    )
+    system_prompt = """You are a tax visualization expert. Create step-by-step visual guides showing how to map values from source tax forms to destination forms.
 
-    user_prompt = f"""
-Create the NEXT step of a visual guide for the topic: "{topic}".
+Your output should be a code-style text block with:
+- Clear header with step number and focus
+- Box-to-line mappings using arrows (→)
+- Specific box numbers and line numbers from IRS documentation
+- Brief explanations
+- Example values where helpful
 
-- Step number: {step_number}
-- User profile (if helpful): {user_profile_str or "unknown"}
-- Recent conversation (for context, if relevant):
+Use the IRS documentation provided to ensure accuracy."""
+
+    user_prompt = f"""Create Step {step_number} of a visual guide for: {source_form} → {target_form}
+
+User Profile: {user_profile_str or "unknown"}
+
+{"IRS Documentation Reference:" + chr(10) + rag_context if rag_context else ""}
+
+Recent conversation context:
 {recent_text or "[no recent messages]"}
 
 Requirements:
-- Output a SINGLE code-style text block (no backticks, just plain text).
-- Start with a header comment bar and step label, for example:
-  # ---------------------------------------------------------
-  #   <TOPIC NAME> VISUAL GUIDE (STEP {step_number})
-  #   Focus: <short focus>
-  # ---------------------------------------------------------
-- Then add 3–8 lines of concise explanation, using comments (#) and arrows (→)
-  to show where values go or how the user should think about the step.
-- Keep it focused on THIS step only. Assume previous steps already appeared above.
-- Keep it under ~120 words.
-"""
+1. Start with a header block like:
+   📋 {source_form} → {target_form} Mapping (Step {step_number}/5)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Focus: [specific focus for this step]
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",  # or whatever model you prefer
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.4,
-    )
+2. Show 1-2 specific box-to-line mappings with arrows (→)
+3. Include brief explanation of what each value represents
+4. Reference the IRS documentation if provided
+5. Add example if helpful
+6. End with a separator line
+7. Keep under 150 words
 
-    snippet = completion.choices[0].message.content.strip()
-    return snippet
+For step {step_number}, focus on:
+- Step 1: Wages/compensation (Box 1)
+- Step 2: Federal tax withheld (Box 2)  
+- Step 3: Social Security (Boxes 3-4)
+- Step 4: Medicare (Boxes 5-6)
+- Step 5: Other codes and state info (Boxes 12, 14)"""
 
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error generating visual: {str(e)}"
 
-def get_next_visual_snippets(topic: str):
-    """
-    Generate the next visual snippet for `topic` via ChatGPT and
-    return ALL snippets accumulated so far for that topic.
-    """
-    next_snippet = generate_visual_snippet(topic)
-
+def get_next_visual_snippets(client: OpenAI, topic: str):
+    """Generate and store the next visual snippet"""
+    next_snippet = generate_visual_snippet(client, topic)
+    
     if topic not in st.session_state.visual_snippets:
         st.session_state.visual_snippets[topic] = []
-
+    
     st.session_state.visual_snippets[topic].append(next_snippet)
-
     return st.session_state.visual_snippets[topic]
 
-# ---------------------------------------------------------
-# 🧠 Checklist Agent helper
-# ---------------------------------------------------------
+# ==========================================
+# Checklist Agent (RAG-Enhanced)
+# ==========================================
 def build_tax_checklist(client: OpenAI, chat_messages, user_profile: dict):
-    """
-    Checklist Agent:
-    Uses the entire conversation + user profile to generate/update
-    a hierarchical tax-filing checklist with detailed sub-items.
-    """
+    """Build checklist using conversation and RAG context"""
     if not chat_messages:
-        return st.session_state.checklist  # nothing to update yet
-
-    # Turn chat messages into a plain-text conversation transcript
+        return st.session_state.checklist
+    
     convo_lines = []
     for m in chat_messages:
         role = m.get("role", "user")
         content = m.get("content", "")
         convo_lines.append(f"{role.upper()}: {content}")
     convo_text = "\n\n".join(convo_lines)
+    
+    # Get RAG context for better checklist generation
+    rag_context = ""
+    profile_type = user_profile.get("employment_status", "")
+    visa_status = user_profile.get("on_visa", "")
+    
+    if "Student" in profile_type and visa_status == "Yes":
+        rag_context = rag_search("Form 1040-NR international student F-1 requirements", k=2)
+    elif "professional" in profile_type.lower():
+        rag_context = rag_search("Form 1040 W-2 filing requirements", k=2)
 
-    system_prompt = """
-You are the CHECKLIST AGENT for a US tax-filing assistant.
+    system_prompt = f"""You are the CHECKLIST AGENT for a US tax-filing assistant.
 
-Another agent ("Intake Agent") is chatting with the user and asking questions.
-You DO NOT talk to the user directly. Your only job is to maintain a
-hierarchical checklist of tax filing tasks and information the user needs,
-based on:
-1) The conversation so far, and
-2) The user's profile (student vs working professional, visa status, W-2 status).
+Your job is to maintain a hierarchical checklist of tax filing tasks based on:
+1) The conversation so far
+2) The user's profile
+3) IRS documentation context
+
+{"Relevant IRS Context:" + chr(10) + rag_context[:500] if rag_context else ""}
 
 You MUST return ONLY valid JSON in this EXACT format:
-
-{
+{{
   "sections": [
-    {
+    {{
       "heading": "Collect W-2 forms",
       "status": "pending",
       "details": [
-        {
-          "item": "Collect W-2 from each employer for the tax year",
-          "status": "pending"
-        },
-        {
-          "item": "Confirm employer name, address, and EIN (Box b)",
-          "status": "pending"
-        },
-        {
-          "item": "Record wages, tips, other compensation (Box 1)",
-          "status": "pending"
-        },
-        {
-          "item": "Record federal income tax withheld (Box 2)",
-          "status": "pending"
-        },
-        {
-          "item": "Capture Social Security and Medicare wages and tax (Boxes 3–6, if applicable)",
-          "status": "pending"
-        }
+        {{"item": "Collect W-2 from each employer", "status": "pending"}},
+        {{"item": "Record wages (Box 1)", "status": "pending"}}
       ]
-    }
+    }}
   ]
-}
+}}
 
 Rules:
-- Use ACTION headings that reference specific forms or steps, for example:
-  * "Collect W-2 forms"
-  * "Gather 1099-INT and 1099-DIV statements"
-  * "Gather 1099-NEC / 1099-K for self-employment income"
-  * "Collect Form 1098-T and tuition payment records"
-  * "Summarize other income (interest, dividends, scholarships, etc.)"
-  * "Confirm filing information on Form 1040-NR"
-- Under each heading, include 3–10 detailed sub-items ("details") that describe
-  concrete information to collect or verify (box numbers, amounts, payer/employer,
-  dates, etc.), not vague phrases.
-- Mark a detail as "done" ONLY if the conversation clearly indicates the user
-  has already provided that information or completed that step. Otherwise "pending".
-- The section "status" is:
-  * "done" only if all or almost all of its details appear completed,
-  * otherwise "pending".
-- Tailor sections to the profile:
-  * Students / on F-1: likely Form 1098-T, scholarship income, on-campus W-2s.
-  * Working professionals: W-2, 1099 income, retirement contributions.
-  * Self-employed / 1099: business income, expenses, estimated taxes, 1099-NEC/1099-K.
-- Provide between 4 and 10 sections total.
-- The user never clicks checkboxes; this checklist is updated only by your inference from the conversation.
-- Do NOT include any explanation text outside the JSON.
-""".strip()
+- Use ACTION headings (e.g., "Collect W-2 forms", "Complete Form 1040-NR")
+- Include 3-10 detailed sub-items per section with specific box numbers
+- Mark "done" ONLY if user explicitly mentioned completing it
+- Tailor to profile:
+  * Students/F-1: Form 1098-T, scholarship income, on-campus W-2s, Form 1040-NR
+  * Working professionals: W-2, 1099, Form 1040
+  * Self-employed: 1099-NEC/1099-K, Schedule C, estimated taxes
+- Provide 4-10 sections total
+- Return ONLY JSON, no explanation text"""
 
     user_profile_text = json.dumps(user_profile, indent=2)
 
-    checklist_resp = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        temperature=0,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": f"User profile:\n{user_profile_text}",
-            },
-            {
-                "role": "user",
-                "content": f"Conversation so far:\n\n{convo_text}",
-            },
-        ],
-    )
-
-    raw = checklist_resp.choices[0].message.content or ""
-
-    # Try to parse JSON out of the response
     try:
-        # In case the model adds stray text, pull out the first {...} block
+        checklist_resp = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"User profile:\n{user_profile_text}"},
+                {"role": "user", "content": f"Conversation so far:\n\n{convo_text}"},
+            ],
+        )
+
+        raw = checklist_resp.choices[0].message.content or ""
+        
         start = raw.index("{")
         end = raw.rindex("}") + 1
         json_str = raw[start:end]
@@ -290,10 +461,7 @@ Rules:
             heading = str(sec.get("heading", "")).strip()
             if not heading:
                 continue
-            sec_status = str(sec.get("status", "pending")).lower()
-            if sec_status not in ["done", "pending"]:
-                sec_status = "pending"
-
+            
             details_raw = sec.get("details", [])
             normalized_details = []
             for det in details_raw:
@@ -304,83 +472,99 @@ Rules:
                 if d_status not in ["done", "pending"]:
                     d_status = "pending"
                 normalized_details.append({"item": text, "status": d_status})
-
-            normalized_sections.append(
-                {
-                    "heading": heading,
-                    "status": sec_status,
-                    "details": normalized_details,
-                }
-            )
+            
+            # Calculate completion percentage
+            done_count = sum(1 for d in normalized_details if d["status"] == "done")
+            completion = int((done_count / len(normalized_details)) * 100) if normalized_details else 0
+            
+            normalized_sections.append({
+                "heading": heading,
+                "status": "done" if completion == 100 else "pending",
+                "completion": completion,
+                "details": normalized_details,
+            })
 
         if normalized_sections:
             return normalized_sections
-    except Exception:
-        # If parsing fails, keep the existing checklist
-        pass
+    except Exception as e:
+        print(f"Checklist error: {e}")
 
     return st.session_state.checklist
 
-
-# ---------------------------------------------------------
-# 🧠 Intake Agent: main chat assistant
-# ---------------------------------------------------------
-INTAKE_SYSTEM_PROMPT = """
-You are the INTAKE AGENT for an AI tax assistant.
+# ==========================================
+# Intake Agent System Prompt (RAG-Enhanced)
+# ==========================================
+def get_intake_system_prompt(user_profile: dict) -> str:
+    """Get intake system prompt with RAG context"""
+    base_prompt = """You are the INTAKE AGENT for an AI tax assistant.
 
 Your role:
-- Talk to the user in a friendly, structured way.
-- Ask step-by-step questions to understand their tax situation (e.g. W-2, 1099, 1098-T).
-- Explain what you’re doing and what information you need.
-- Respond naturally to their questions like “I need help with W-2” or “I’m on F-1 visa”.
-- DO NOT show or mention any internal checklist or multi-agent architecture.
+- Talk to the user in a friendly, structured way
+- Ask step-by-step questions to understand their tax situation
+- Explain what you're doing and what information you need
+- Respond naturally to questions like "I need help with W-2" or "I'm on F-1 visa"
+- DO NOT mention any internal checklist or multi-agent architecture
 
-Another hidden agent (Checklist Agent) observes this conversation and maintains a
-detailed hierarchical checklist. You do NOT manage the checklist directly, you
-just have a good conversation and collect information.
-""".strip()
+Another hidden agent maintains a detailed checklist based on your conversation."""
 
+    # Add RAG context based on user profile
+    rag_context = ""
+    if user_profile.get("on_visa") == "Yes":
+        rag_context = rag_search("nonresident alien F-1 student tax filing", k=1)
+    elif user_profile.get("w2_status") and "self-employed" in user_profile.get("w2_status", "").lower():
+        rag_context = rag_search("self-employment tax 1099-NEC Schedule C", k=1)
+    
+    if rag_context:
+        base_prompt += f"\n\nRelevant IRS guidance you can reference:\n{rag_context[:400]}"
+    
+    return base_prompt
 
-# ---------------------------------------------------------
-# 🔑 OpenAI setup
-# ---------------------------------------------------------
+# ==========================================
+# OpenAI Setup
+# ==========================================
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 if not openai_api_key:
-    st.info("Set your OpenAI API key in the environment variable OPENAI_API_KEY.", icon="🗝️")
-    client = None
-else:
-    client = OpenAI(api_key=openai_api_key)
+    st.warning("⚠️ Set your OpenAI API key in environment variable OPENAI_API_KEY")
+    openai_api_key = st.text_input("Enter OpenAI API Key:", type="password")
+    if not openai_api_key:
+        st.stop()
 
-# ---------------------------------------------------------
-# 🏷️ Page title & description
-# ---------------------------------------------------------
+client = OpenAI(api_key=openai_api_key)
+
+# ==========================================
+# Page Title & Description
+# ==========================================
 st.title("💬 AI Tax Assistant")
-st.write(
-    "This assistant walks you through US tax filing questions. "
-    "As you chat, a separate agent builds a detailed tax-filing checklist for you."
-)
+st.caption("Powered by OpenAI GPT + RAG (ChromaDB) with Visual Form Mapping")
 
-# ---------------------------------------------------------
-# 🧍 User profile (sidebar) — simple display elements, not a checklist
-# ---------------------------------------------------------
+# Check RAG status
+db = load_vector_db()
+if db:
+    st.success("✅ RAG Database Connected", icon="🗄️")
+else:
+    st.warning("⚠️ RAG Database not found. Visual guides will use general knowledge only.")
+
+# ==========================================
+# Sidebar
+# ==========================================
 with st.sidebar:
     st.header("👤 Your Tax Profile")
-
+    
     user_type = st.radio(
         "I am a...",
         ("Student", "Working professional"),
         index=0,
         key="user_type_radio",
     )
-
+    
     visa_status = st.radio(
         "Are you currently on a visa in the U.S.?",
         ("Yes", "No"),
         index=0,
         key="visa_status_radio",
     )
-
+    
     w2_status = st.selectbox(
         "What best describes your W-2 / income status?",
         (
@@ -391,122 +575,280 @@ with st.sidebar:
         ),
         key="w2_status_select",
     )
-
-    # Store in session state for the checklist agent
+    
     st.session_state.user_profile = {
         "employment_status": user_type,
         "on_visa": visa_status,
         "w2_status": w2_status,
     }
-
-# ---------------------------------------------------------
-# 💬 Main chat UI (Intake Agent)
-# ---------------------------------------------------------
-if client is not None:
-    # Display previous messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Chat input
-    prompt = st.chat_input(
-        "Tell me how I can help with your taxes today (e.g., 'I need help with my W-2')."
+    
+    st.divider()
+    
+    # ==========================================
+    # Document Upload Section
+    # ==========================================
+    st.subheader("📎 Upload Documents")
+    
+    uploaded_doc = st.file_uploader(
+        "Upload tax document (PDF/DOCX/TXT)",
+        type=["pdf", "docx", "txt"],
+        key="doc_uploader"
     )
-    if prompt:
-        # Add user message to conversation
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    if uploaded_doc:
+        with st.spinner("📄 Extracting text..."):
+            extracted_text = extract_text_from_file(uploaded_doc)
+            st.session_state.uploaded_doc_text = extracted_text
+            st.session_state.uploaded_doc_name = uploaded_doc.name
+        
+        st.success(f"✅ {uploaded_doc.name}")
+        
+        with st.expander("📄 Preview", expanded=False):
+            st.text_area("Content", extracted_text[:500] + "...", height=100, disabled=True)
+        
+        if st.button("🗑️ Clear Doc", key="clear_doc"):
+            st.session_state.uploaded_doc_text = None
+            st.session_state.uploaded_doc_name = None
+            st.rerun()
+    
+    # Image upload (OCR)
+    uploaded_img = st.file_uploader(
+        "Upload W-2/1099 Image (OCR)",
+        type=["png", "jpg", "jpeg"],
+        key="img_uploader"
+    )
+    
+    if uploaded_img:
+        st.image(uploaded_img, caption="Uploaded", use_container_width=True)
+        
+        with st.spinner("🔍 Running OCR..."):
+            ocr_text = extract_text_from_image(uploaded_img)
+            st.session_state.uploaded_img_text = ocr_text
+            st.session_state.uploaded_img_name = uploaded_img.name
+        
+        st.success("✅ OCR completed")
+        
+        with st.expander("🔍 OCR Result", expanded=False):
+            st.text_area("Extracted", ocr_text[:500], height=100, disabled=True)
+        
+        if st.button("🗑️ Clear Image", key="clear_img"):
+            st.session_state.uploaded_img_text = None
+            st.session_state.uploaded_img_name = None
+            st.rerun()
+    
+    st.divider()
+    
+    # ==========================================
+    # Live Checklist (with completion %)
+    # ==========================================
+    st.header("🧾 Live Tax-filing Checklist")
+    
+    if st.session_state.checklist:
+        # Overall progress
+        all_sections = st.session_state.checklist
+        total_completion = sum(s.get('completion', 0) for s in all_sections) / len(all_sections)
+        st.progress(total_completion / 100)
+        st.caption(f"Overall Progress: {total_completion:.0f}%")
+        
+        with st.expander("Checklist (auto-updated)", expanded=True):
+            for section in st.session_state.checklist:
+                heading = section.get("heading", "Unnamed section")
+                completion = section.get("completion", 0)
+                details = section.get("details", [])
+                
+                status_emoji = "✅" if completion == 100 else "⏳"
+                st.markdown(f"{status_emoji} **{heading}** ({completion}%)")
+                
+                for det in details:
+                    d_item = det.get("item", "")
+                    d_status = det.get("status", "pending").lower()
+                    d_emoji = "✅" if d_status == "done" else "⏳"
+                    st.markdown(f"- {d_emoji} {d_item}")
+                
+                st.markdown("")
+    else:
+        st.info("💡 Start chatting to see your personalized checklist!")
 
-        # Intake Agent response (streaming)
-        with st.chat_message("assistant"):
-            stream = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                stream=True,
-                messages=[
-                    {"role": "system", "content": INTAKE_SYSTEM_PROMPT},
-                    *st.session_state.messages,
-                ],
-            )
-            response_text = st.write_stream(stream)
+# ==========================================
+# Active Documents Indicator
+# ==========================================
+if st.session_state.get('uploaded_doc_text') or st.session_state.get('uploaded_img_text'):
+    active_docs = []
+    if st.session_state.get('uploaded_doc_name'):
+        active_docs.append(f"📄 {st.session_state.uploaded_doc_name}")
+    if st.session_state.get('uploaded_img_name'):
+        active_docs.append(f"🖼️ {st.session_state.uploaded_img_name}")
+    
+    st.info(f"📎 Active documents: {', '.join(active_docs)}")
+    
+    if st.button("🗑️ Clear All Documents"):
+        st.session_state.uploaded_doc_text = None
+        st.session_state.uploaded_img_text = None
+        st.session_state.uploaded_doc_name = None
+        st.session_state.uploaded_img_name = None
+        st.rerun()
 
-        # Save assistant response
-        st.session_state.messages.append(
-            {"role": "assistant", "content": response_text}
+# ==========================================
+# Main Chat UI
+# ==========================================
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+prompt = st.chat_input("Tell me how I can help with your taxes today...")
+
+if prompt:
+    # Build context with uploaded documents
+    context_parts = []
+    
+    if st.session_state.get('uploaded_doc_text'):
+        context_parts.append(f"[Document: {st.session_state.uploaded_doc_name}]\n{st.session_state.uploaded_doc_text[:2000]}")
+    
+    if st.session_state.get('uploaded_img_text'):
+        context_parts.append(f"[OCR from: {st.session_state.uploaded_img_name}]\n{st.session_state.uploaded_img_text}")
+    
+    full_prompt = "\n\n".join(context_parts) + f"\n\nUser Question: {prompt}" if context_parts else prompt
+    
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+        if context_parts:
+            st.caption("📎 *Using uploaded documents*")
+    
+    # Get RAG-enhanced system prompt
+    system_prompt = get_intake_system_prompt(st.session_state.user_profile)
+    
+    # Generate response
+    with st.chat_message("assistant"):
+        with st.status("🤖 Thinking...", expanded=False) as status:
+            # Search RAG for relevant context
+            rag_results = rag_search(prompt, k=2)
+            
+            # Build messages with RAG context
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *st.session_state.messages[:-1],  # Previous messages
+                {"role": "user", "content": f"{full_prompt}\n\n[Relevant IRS Info: {rag_results[:500]}]" if rag_results else full_prompt}
+            ]
+            
+            status.update(label="✅ Generating response...", state="running")
+        
+        stream = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            stream=True,
+            messages=messages,
         )
-
-        # After each user+assistant turn, call Checklist Agent to update the checklist
+        response_text = st.write_stream(stream)
+        
+        # Clear used documents
+        if context_parts:
+            st.caption("📎 *Documents processed*")
+            st.session_state.uploaded_doc_text = None
+            st.session_state.uploaded_img_text = None
+            st.session_state.uploaded_doc_name = None
+            st.session_state.uploaded_img_name = None
+    
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
+    
+    # Update checklist
+    with st.status("📋 Updating checklist...", expanded=False):
         st.session_state.checklist = build_tax_checklist(
             client,
             st.session_state.messages,
             st.session_state.user_profile,
         )
 
-# ---------------------------------------------------------
-# 🔘 Incremental visual help (can be W-2 or other topics)
-# ---------------------------------------------------------
-st.markdown("### Need more visual help with how a form box maps to your return?")
+# ==========================================
+# Visual Help Section (RAG-Enhanced)
+# ==========================================
+st.divider()
+st.subheader("🧾 Visual Form Mapping Guide (RAG-Enhanced)")
 
-col_v1, col_v2 = st.columns([1, 2])
+st.markdown("""
+Click **"Show Next Step"** to see step-by-step visual guides for mapping your tax forms.
+The system uses IRS documentation from the RAG database for accurate mappings.
+""")
 
-with col_v1:
-    if st.button("🧾 Show step"):
-        # If we don't have a topic yet (or you want to re-evaluate each click),
-        # ask GPT to infer the most relevant topic from the conversation.
-        if st.session_state.current_visual_topic is None:
-            st.session_state.current_visual_topic = infer_visual_topic()
+col1, col2, col3 = st.columns([1, 1, 2])
 
-        topic = st.session_state.current_visual_topic
+with col1:
+    if st.button("🧾 Show Next Step", key="visual_next", use_container_width=True):
+        with st.spinner("🔍 Generating with RAG..."):
+            if not st.session_state.current_visual_topic:
+                st.session_state.current_visual_topic = infer_visual_topic(client)
+            
+            topic = st.session_state.current_visual_topic
+            get_next_visual_snippets(client, topic)
 
-        # Generate and store the next visual snippet for that topic
-        get_next_visual_snippets(topic)
+with col2:
+    if st.button("🔄 Reset Visuals", key="visual_reset", use_container_width=True):
+        st.session_state.visual_snippets = {}
+        st.session_state.current_visual_topic = None
+        st.rerun()
 
-with col_v2:
-    topic = st.session_state.current_visual_topic
-    if topic:
-        topic_snippets = st.session_state.visual_snippets.get(topic, [])
-        if topic_snippets:
-            st.caption(f"Visual topic: `{topic}`")
-            for snip in topic_snippets:
-                st.code(snip, language="markdown")
-        else:
-            st.caption(
-                "Topic detected, but no visual steps yet. "
-                "Click the button to see the first snippet."
-            )
+with col3:
+    topic_options = [
+        "Auto-detect",
+        "w2_to_1040nr", "w2_to_1040",
+        "1098t_to_1040nr", "1098t_to_1040",
+        "1099int_to_1040", "1099nec_to_schedule_c"
+    ]
+    
+    selected = st.selectbox("Select Form Mapping:", topic_options, key="topic_select")
+    
+    if selected != "Auto-detect":
+        st.session_state.current_visual_topic = selected
+
+# Display current topic
+current_topic = st.session_state.current_visual_topic
+if current_topic:
+    st.caption(f"📌 Current topic: `{current_topic}`")
+
+# Display all generated snippets
+if current_topic:
+    snippets = st.session_state.visual_snippets.get(current_topic, [])
+    
+    if snippets:
+        st.markdown("### 📋 Generated Visual Steps")
+        
+        for i, snippet in enumerate(snippets, 1):
+            with st.expander(f"Step {i}", expanded=(i == len(snippets))):
+                st.code(snippet, language="markdown")
+        
+        st.caption(f"*{len(snippets)} step(s) generated. Click 'Show Next Step' for more.*")
     else:
-        st.caption(
-            "Click the button to see the first mapping snippet. "
-            "The assistant will detect which form/topic you're working on "
-            "and then reveal each step."
+        st.info("👆 Click 'Show Next Step' to generate the first visual guide.")
+else:
+    st.info("💡 Start a conversation, then click 'Show Next Step' to see form mapping visuals.")
+
+# ==========================================
+# IRS Document Search Section
+# ==========================================
+st.divider()
+with st.expander("📚 Search IRS Documents (RAG)", expanded=False):
+    st.markdown("Search the IRS document database directly for specific information.")
+    
+    col_s1, col_s2 = st.columns([3, 1])
+    
+    with col_s1:
+        search_query = st.text_input(
+            "Search query:",
+            placeholder="e.g., W-2 Box 2 federal withholding",
+            key="irs_search"
         )
-
-# ---------------------------------------------------------
-# 🧾 Read-only dynamic checklist (Checklist Agent output)
-# ---------------------------------------------------------
-with st.sidebar:
-    st.markdown("---")
-    st.header("🧾 Live Tax-filing Checklist")
-
-    if st.session_state.checklist:
-        with st.expander("Checklist (auto-updated from your chat)", expanded=True):
-            for section in st.session_state.checklist:
-                heading = section.get("heading", "Unnamed section")
-                sec_status = section.get("status", "pending").lower()
-                details = section.get("details", [])
-
-                status_emoji = "✅" if sec_status == "done" else "⏳"
-                st.markdown(f"{status_emoji} **{heading}**")
-
-                # Sub-items (details) as bullet points, read-only
-                for det in details:
-                    d_item = det.get("item", "")
-                    d_status = det.get("status", "pending").lower()
-                    d_emoji = "✅" if d_status == "done" else "⏳"
-                    st.markdown(f"- {d_emoji} {d_item}")
-
-                st.markdown("")  # spacing
-    else:
-        st.info(
-            "As you answer questions and say things like "
-            "'I need help with my W-2' or 'I have 1099 income', "
-            "a detailed checklist will appear here."
-        )
+    
+    with col_s2:
+        if st.button("🔍 Search", key="search_btn", use_container_width=True):
+            if search_query:
+                with st.spinner("Searching..."):
+                    st.session_state.search_result = rag_search(search_query, k=3)
+    
+    if st.session_state.get('search_result'):
+        st.markdown("### 📄 Search Results")
+        st.markdown(st.session_state.search_result)
+        
+        if st.button("🗑️ Clear Results", key="clear_search"):
+            st.session_state.search_result = None
+            st.rerun()
