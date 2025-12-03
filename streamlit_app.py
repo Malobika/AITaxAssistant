@@ -448,7 +448,7 @@ st.markdown("### Need more visual help with how a form box maps to your return?"
 col_v1, col_v2 = st.columns([1, 2])
 
 with col_v1:
-    if st.button("🧾 Show next step"):
+    if st.button("🧾 Show step"):
         # If we don't have a topic yet (or you want to re-evaluate each click),
         # ask GPT to infer the most relevant topic from the conversation.
         if st.session_state.current_visual_topic is None:
