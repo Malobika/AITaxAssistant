@@ -15,6 +15,9 @@ import uuid
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
+
+
+GOOGLE_API_KEY="AIzaSyD-NRi7pKPt-WalttQ9gPYpEFdhQv_TGZg"
 from taxbrainmerged import TaxOrchestrator, UserProfile, PIIHandler, LEGAL_DISCLAIMER, PRIVACY_NOTICE
 from sessionmemory import SessionMemoryManager, UserSession
 
