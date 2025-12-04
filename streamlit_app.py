@@ -9,13 +9,14 @@ except (ImportError, KeyError):
 import streamlit as st
 import os
 import sys
+import uuid
 
-# Ensure we can find tax_brain_merged
+# Ensure we can find local modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
-from tax_brain_merged import TaxOrchestrator, UserProfile, PIIHandler, LEGAL_DISCLAIMER, PRIVACY_NOTICE
-from sessionmemory import SessionMemoryManager, UserSession, get_memory_manager
+from taxbrainmerged import TaxOrchestrator, UserProfile, PIIHandler, LEGAL_DISCLAIMER, PRIVACY_NOTICE
+from sessionmemory import SessionMemoryManager, UserSession
 
 # OCR imports
 try:
@@ -89,18 +90,149 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# OCR Model Loading (Cached)
+# Cached Resource Loaders
 # ==========================================
 @st.cache_resource
 def load_ocr():
+    """Load OCR model (cached)"""
     if OCR_AVAILABLE:
         return easyocr.Reader(["en"], gpu=False)
     return None
+
+@st.cache_resource
+def get_memory_manager():
+    """Get or create SessionMemoryManager (cached singleton)"""
+    try:
+        return SessionMemoryManager()
+    except Exception as e:
+        st.error(f"Failed to initialize session memory: {e}")
+        return None
+
+# ==========================================
+# Session Helper Functions
+# ==========================================
+def get_or_create_session_id() -> str:
+    """Get existing session ID from URL params or create new one"""
+    # Check URL query params first
+    query_params = st.query_params
+    session_id = query_params.get("session_id", None)
+    
+    # Check session state
+    if not session_id and 'session_id' in st.session_state:
+        session_id = st.session_state.session_id
+    
+    # Create new if not found
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    
+    return session_id
+
+def load_session_data(memory_manager: SessionMemoryManager, session_id: str) -> UserSession:
+    """Load or create session from memory manager"""
+    if not memory_manager:
+        # Return a default session if memory manager unavailable
+        return UserSession(session_id=session_id)
+    
+    # Try to get existing session
+    session = memory_manager.get_session(session_id)
+    
+    if not session:
+        # Create new session
+        session = memory_manager.create_session()
+        # Override the auto-generated session_id with our desired one
+        session.session_id = session_id
+        memory_manager.save_session(session)
+    
+    return session
+
+def restore_session_state(memory_manager: SessionMemoryManager, session: UserSession):
+    """Restore Streamlit session state from persistent memory"""
+    if not memory_manager or not session:
+        return
+    
+    # Restore user profile
+    st.session_state.user_profile = UserProfile(
+        citizenship_status=session.citizenship_status,
+        student_status=session.student_status,
+        employment_details=session.employment_details,
+        tax_filing_experience=session.tax_filing_experience,
+        residency_duration=session.residency_duration,
+        income=session.income,
+        residency_state=session.residency_state,
+        filing_status=session.filing_status
+    )
+    
+    # Restore conversation history
+    messages = memory_manager.get_conversation_history(session.session_id)
+    if messages:
+        st.session_state.messages = []
+        for msg in messages:
+            content = msg.get('content', '')
+            # Remove the "role: " prefix if present
+            if ': ' in content and content.split(': ')[0].lower() in ['user', 'assistant']:
+                content = content.split(': ', 1)[1]
+            st.session_state.messages.append({
+                "role": msg.get('role', 'user'),
+                "content": content
+            })
+    
+    # Restore checklist
+    checklist = memory_manager.get_checklist(session.session_id)
+    if checklist:
+        st.session_state.checklist = checklist
+
+def save_session_state(memory_manager: SessionMemoryManager, session: UserSession,
+                       user_profile: UserProfile, checklist: list, messages: list):
+    """Save current session state to persistent memory"""
+    if not memory_manager or not session:
+        return
+    
+    # Update session with current profile data
+    session.citizenship_status = user_profile.citizenship_status
+    session.student_status = user_profile.student_status
+    session.employment_details = user_profile.employment_details
+    session.tax_filing_experience = user_profile.tax_filing_experience
+    session.residency_duration = user_profile.residency_duration
+    session.income = user_profile.income
+    session.residency_state = user_profile.residency_state
+    session.filing_status = user_profile.filing_status
+    
+    # Calculate profile completion
+    profile_fields = [
+        session.citizenship_status, session.student_status,
+        session.employment_details, session.income, session.residency_state
+    ]
+    filled_fields = sum(1 for f in profile_fields if f is not None)
+    session.profile_completion = (filled_fields / len(profile_fields)) * 100
+    
+    # Calculate checklist completion
+    if checklist:
+        session.checklist_completion = sum(s.get('completion', 0) for s in checklist) / len(checklist)
+    else:
+        session.checklist_completion = 0.0
+    
+    # Save session
+    memory_manager.save_session(session)
+    
+    # Save checklist
+    memory_manager.save_checklist(session.session_id, checklist)
+    
+    # Save new messages (only ones not already saved)
+    existing_messages = memory_manager.get_conversation_history(session.session_id)
+    existing_count = len(existing_messages)
+    
+    for msg in messages[existing_count:]:
+        memory_manager.save_message(
+            session.session_id,
+            msg.get('role', 'user'),
+            msg.get('content', '')
+        )
 
 # ==========================================
 # Document Text Extraction (with PII masking)
 # ==========================================
 def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded file with PII masking"""
     file_type = uploaded_file.type
     text = ""
     
@@ -129,6 +261,7 @@ def extract_text_from_file(uploaded_file):
     return masked_text, pii_counts, warning
 
 def extract_text_from_image(uploaded_image):
+    """Extract text from image using OCR with PII masking"""
     if not OCR_AVAILABLE:
         return "❌ OCR not installed.", {}, ""
     
@@ -152,7 +285,7 @@ def extract_text_from_image(uploaded_image):
 # ==========================================
 # Sidebar Rendering
 # ==========================================
-def render_sidebar():
+def render_sidebar(memory_manager: SessionMemoryManager):
     with st.sidebar:
         # Privacy Notice at top of sidebar
         with st.expander("🔒 Privacy & Data Notice", expanded=False):
@@ -190,6 +323,14 @@ def render_sidebar():
         # Document upload
         st.subheader("📎 Upload Documents")
         
+        # Upload Warning
+        st.markdown("""
+        <div class="upload-warning">
+        ⚠️ <strong>Before uploading:</strong> We recommend using documents with 
+        sample/redacted SSNs. Any detected sensitive data will be automatically masked.
+        </div>
+        """, unsafe_allow_html=True)
+        
         uploaded_doc = st.file_uploader(
             "Upload tax document (PDF/DOCX/TXT)",
             type=["pdf", "docx", "txt"],
@@ -197,15 +338,22 @@ def render_sidebar():
         )
         
         if uploaded_doc:
-            with st.spinner("📄 Extracting text..."):
-                extracted_text = extract_text_from_file(uploaded_doc)
+            with st.spinner("📄 Extracting & securing text..."):
+                extracted_text, pii_counts, pii_warning = extract_text_from_file(uploaded_doc)
                 st.session_state.uploaded_doc_text = extracted_text
                 st.session_state.uploaded_doc_name = uploaded_doc.name
             
             st.success(f"✅ Extracted from: {uploaded_doc.name}")
             
-            with st.expander("📄 Preview", expanded=False):
-                st.text_area("Content", extracted_text[:500] + "...", height=150, disabled=True)
+            # Show PII warning if detected
+            if pii_counts:
+                st.warning(f"🔒 Masked {sum(pii_counts.values())} sensitive item(s)")
+                with st.expander("View PII Details", expanded=False):
+                    st.markdown(pii_warning)
+            
+            with st.expander("📄 Preview (Masked)", expanded=False):
+                preview = extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text
+                st.text_area("Content", preview, height=150, disabled=True)
             
             if st.button("🗑️ Clear Document", key="clear_doc"):
                 st.session_state.uploaded_doc_text = None
@@ -222,12 +370,18 @@ def render_sidebar():
         if uploaded_img:
             st.image(uploaded_img, caption="Uploaded", use_container_width=True)
             
-            with st.spinner("🔍 Running OCR..."):
-                ocr_text = extract_text_from_image(uploaded_img)
+            with st.spinner("🔍 Running OCR & securing data..."):
+                ocr_text, pii_counts, pii_warning = extract_text_from_image(uploaded_img)
                 st.session_state.uploaded_img_text = ocr_text
                 st.session_state.uploaded_img_name = uploaded_img.name
             
-            st.success(f"✅ OCR completed")
+            st.success("✅ OCR completed")
+            
+            # Show PII warning if detected
+            if pii_counts:
+                st.warning(f"🔒 Masked {sum(pii_counts.values())} sensitive item(s)")
+                with st.expander("View PII Details", expanded=False):
+                    st.markdown(pii_warning)
             
             if st.button("🗑️ Clear Image", key="clear_img"):
                 st.session_state.uploaded_img_text = None
@@ -241,7 +395,6 @@ def render_sidebar():
         # ==========================================
         st.subheader("💾 Session Management")
         
-        # Show session ID
         if 'session_id' in st.session_state:
             st.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
             
@@ -268,9 +421,8 @@ def render_sidebar():
             
             with col2:
                 if st.button("🗑️ Clear Session", key="clear_session", use_container_width=True):
-                    # Delete from memory
-                    memory_manager = load_memory_manager()
-                    memory_manager.delete_session(st.session_state.session_id)
+                    if memory_manager:
+                        memory_manager.delete_session(st.session_state.session_id)
                     
                     # Clear session state
                     for key in list(st.session_state.keys()):
@@ -287,12 +439,10 @@ def render_sidebar():
                 )
                 
                 if st.button("Load Session", key="load_session_btn"):
-                    if load_session_id:
-                        memory_manager = load_memory_manager()
+                    if load_session_id and memory_manager:
                         loaded_session = memory_manager.get_session(load_session_id)
                         
                         if loaded_session:
-                            # Clear current state
                             st.session_state.session_id = load_session_id
                             st.session_state.user_session = loaded_session
                             st.session_state.session_loaded = False  # Force reload
@@ -367,7 +517,6 @@ def render_visual_help():
             st.rerun()
     
     with col3:
-        # Topic selector
         topic_options = [
             "Auto-detect",
             "w2_to_1040nr", "w2_to_1040",
@@ -468,7 +617,7 @@ def main():
         with tab2:
             st.markdown(PRIVACY_NOTICE)
         
-        # Acknowledgment checkbox (optional but recommended)
+        # Acknowledgment checkbox
         if 'disclaimer_acknowledged' not in st.session_state:
             st.session_state.disclaimer_acknowledged = False
         
@@ -479,7 +628,9 @@ def main():
         )
         st.session_state.disclaimer_acknowledged = acknowledged
     
-    # Initialize API key
+    # ==========================================
+    # Initialize API Key
+    # ==========================================
     if 'api_key' not in st.session_state:
         st.session_state.api_key = os.environ.get("GOOGLE_API_KEY", "")
         try:
@@ -488,7 +639,6 @@ def main():
         except:
             pass
     
-    # Check for API key
     if not st.session_state.api_key:
         st.error("⚠️ Please set GOOGLE_API_KEY in environment variables or Streamlit secrets.")
         st.session_state.api_key = st.text_input("Enter Google API Key:", type="password")
@@ -498,29 +648,51 @@ def main():
     # ==========================================
     # Initialize Session Memory
     # ==========================================
-    memory_manager = load_memory_manager()
+    memory_manager = get_memory_manager()
     
     # Get or create session ID
     if 'session_id' not in st.session_state:
         st.session_state.session_id = get_or_create_session_id()
     
-    # Load session from memory
+    # Load session from memory (only once)
     if 'session_loaded' not in st.session_state:
-        session = load_session_from_memory(memory_manager, st.session_state.session_id)
+        session = load_session_data(memory_manager, st.session_state.session_id)
         st.session_state.user_session = session
         
-        # Load existing data from memory
-        load_session_state_from_memory(memory_manager, session)
+        # Initialize defaults first
+        if 'user_profile' not in st.session_state:
+            st.session_state.user_profile = UserProfile()
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
+        if 'checklist' not in st.session_state:
+            st.session_state.checklist = []
+        
+        # Restore from memory
+        restore_session_state(memory_manager, session)
         st.session_state.session_loaded = True
     
-    # Initialize system
+    # Show memory status
+    if memory_manager:
+        st.success("✅ Session Memory Connected", icon="💾")
+    else:
+        st.warning("⚠️ Session memory unavailable. Progress won't persist.")
+    
+    # ==========================================
+    # Initialize Orchestrator
+    # ==========================================
     if 'orchestrator' not in st.session_state:
         with st.spinner("🔧 Initializing AI Tax Assistant..."):
             try:
                 st.session_state.orchestrator = TaxOrchestrator(st.session_state.api_key)
-                st.session_state.user_profile = UserProfile()
-                st.session_state.messages = []
-                st.session_state.checklist = []
+                
+                # Initialize other session state if not already set
+                if 'user_profile' not in st.session_state:
+                    st.session_state.user_profile = UserProfile()
+                if 'messages' not in st.session_state:
+                    st.session_state.messages = []
+                if 'checklist' not in st.session_state:
+                    st.session_state.checklist = []
+                
                 st.session_state.current_visual_topic = None
                 st.session_state.latest_visual_snippet = None
                 st.session_state.uploaded_doc_text = None
@@ -528,6 +700,7 @@ def main():
                 st.session_state.uploaded_doc_name = None
                 st.session_state.uploaded_img_name = None
                 st.session_state.search_result = None
+                
                 st.success("✅ System ready!")
             except Exception as e:
                 st.error(f"❌ Initialization failed: {str(e)}")
@@ -535,8 +708,8 @@ def main():
                 st.code(traceback.format_exc())
                 st.stop()
     
-    # Render sidebar
-    render_sidebar()
+    # Render sidebar (pass memory_manager for session operations)
+    render_sidebar(memory_manager)
     
     # Active documents indicator
     if st.session_state.get('uploaded_doc_text') or st.session_state.get('uploaded_img_text'):
@@ -552,7 +725,9 @@ def main():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
     
-    # Chat input
+    # ==========================================
+    # Chat Input
+    # ==========================================
     if prompt := st.chat_input("Ask me anything about your taxes..."):
         # Check for PII in user input
         detected_pii = PIIHandler.detect_pii(prompt)
@@ -562,10 +737,16 @@ def main():
         context_parts = []
         
         if st.session_state.get('uploaded_doc_text'):
-            context_parts.append(f"[Document: {st.session_state.uploaded_doc_name}]\n{st.session_state.uploaded_doc_text[:2000]}")
+            doc_text = st.session_state.uploaded_doc_text
+            if isinstance(doc_text, tuple):
+                doc_text = doc_text[0]  # Extract text from tuple
+            context_parts.append(f"[Document: {st.session_state.uploaded_doc_name}]\n{doc_text[:2000]}")
         
         if st.session_state.get('uploaded_img_text'):
-            context_parts.append(f"[OCR from: {st.session_state.uploaded_img_name}]\n{st.session_state.uploaded_img_text}")
+            img_text = st.session_state.uploaded_img_text
+            if isinstance(img_text, tuple):
+                img_text = img_text[0]
+            context_parts.append(f"[OCR from: {st.session_state.uploaded_img_name}]\n{img_text}")
         
         full_prompt = "\n\n".join(context_parts) + f"\n\nUser Question: {masked_prompt}" if context_parts else masked_prompt
         display_prompt = prompt
@@ -575,12 +756,12 @@ def main():
         with st.chat_message("user"):
             st.markdown(display_prompt)
             
-            # Show PII warning if detected in user input
+            # Show PII warning if detected
             if pii_counts:
                 st.markdown(f"""
                 <div class="pii-warning">
                 🔒 <strong>Privacy Protection:</strong> We detected and masked {sum(pii_counts.values())} 
-                sensitive item(s) in your message (SSN, account numbers, etc.) before processing.
+                sensitive item(s) in your message before processing.
                 </div>
                 """, unsafe_allow_html=True)
         
@@ -607,7 +788,7 @@ def main():
                     status.update(label="✅ Done!", state="complete")
                     st.markdown(answer)
                     
-                    # Add reminder disclaimer after response
+                    # Add reminder disclaimer
                     st.caption("*⚠️ Remember: This is educational guidance only, not professional tax advice.*")
                     
                     # Clear used documents
@@ -623,17 +804,6 @@ def main():
         
         st.session_state.messages.append({"role": "assistant", "content": answer})
         
-        # ==========================================
-        # Sync to Persistent Memory
-        # ==========================================
-        sync_session_to_memory(
-            memory_manager,
-            st.session_state.user_session,
-            st.session_state.user_profile,
-            st.session_state.checklist,
-            st.session_state.messages
-        )
-        
         # Update checklist
         with st.status("📋 Updating checklist...", expanded=False) as checklist_status:
             try:
@@ -646,18 +816,21 @@ def main():
             except Exception as e:
                 checklist_status.update(label="⚠️ Checklist update failed", state="error")
         
-        # Final sync to memory after checklist update
-        sync_session_to_memory(
-            memory_manager,
-            st.session_state.user_session,
-            st.session_state.user_profile,
-            st.session_state.checklist,
-            st.session_state.messages
-        )
+        # ==========================================
+        # Save to Persistent Memory
+        # ==========================================
+        if memory_manager and 'user_session' in st.session_state:
+            save_session_state(
+                memory_manager,
+                st.session_state.user_session,
+                st.session_state.user_profile,
+                st.session_state.checklist,
+                st.session_state.messages
+            )
         
         st.rerun()
     
-    # Render Visual Help Section (RAG-Enhanced)
+    # Render Visual Help Section
     render_visual_help()
     
     # Render IRS Document Search
