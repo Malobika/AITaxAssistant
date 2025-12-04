@@ -1,6 +1,253 @@
 import os
 import sys
 
+"""
+PII Handler, Legal Disclaimer, and Privacy Notice
+Add this code to your taxbrainmerged.py file (at the top, after imports)
+OR save as separate file and import
+"""
+
+import re
+from typing import Dict, List, Tuple
+
+# ==========================================
+# Legal Disclaimer
+# ==========================================
+LEGAL_DISCLAIMER = """
+⚠️ **IMPORTANT DISCLAIMER**
+
+This AI Tax Assistant is for **educational and informational purposes only**.
+
+• I am NOT a Certified Public Accountant (CPA), tax attorney, or licensed tax professional.
+• This tool does NOT constitute professional tax advice, legal advice, or financial advice.
+• Tax laws are complex and vary by individual circumstances. Always consult a qualified tax professional.
+• You are solely responsible for the accuracy of your tax filings.
+• Anthropic/OpenAI and the developers of this tool are not liable for any errors or omissions.
+
+By using this tool, you acknowledge and accept these terms.
+"""
+
+PRIVACY_NOTICE = """
+🔒 **PRIVACY & DATA HANDLING NOTICE**
+
+• We automatically detect and mask sensitive information (SSN, EIN, account numbers).
+• Your data is processed in-session only and is NOT permanently stored.
+• Uploaded documents are processed temporarily and cleared after use.
+• We recommend NOT uploading documents containing actual SSNs or bank account numbers.
+• For maximum security, use sample/dummy data when learning how to file.
+
+Your privacy is important to us.
+"""
+
+# ==========================================
+# PII Detection and Masking Utilities
+# ==========================================
+class PIIHandler:
+    """Handles detection and masking of Personally Identifiable Information"""
+    
+    # Regex patterns for sensitive data
+    PATTERNS = {
+        'ssn': [
+            r'\b\d{3}-\d{2}-\d{4}\b',           # XXX-XX-XXXX
+            r'\b\d{3}\s\d{2}\s\d{4}\b',         # XXX XX XXXX
+            r'\b\d{9}\b(?!\d)',                  # XXXXXXXXX (9 digits, not followed by more digits)
+        ],
+        'ein': [
+            r'\b\d{2}-\d{7}\b',                  # XX-XXXXXXX (EIN format)
+        ],
+        'bank_account': [
+            r'\b\d{10,17}\b',                    # 10-17 digit account numbers
+        ],
+        'routing_number': [
+            r'\b0\d{8}\b|\b1\d{8}\b|\b2\d{8}\b|\b3[0-2]\d{7}\b',  # Valid routing number ranges
+        ],
+        'credit_card': [
+            r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',  # Credit card with separators
+            r'\b\d{16}\b',                       # 16 digits continuous
+        ],
+        'phone': [
+            r'\b\(\d{3}\)\s?\d{3}[-.\s]?\d{4}\b',  # (XXX) XXX-XXXX
+            r'\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b',    # XXX-XXX-XXXX
+        ],
+        'email': [
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        ],
+    }
+    
+    # What to replace with
+    MASKS = {
+        'ssn': '***-**-****',
+        'ein': '**-*******',
+        'bank_account': '[ACCOUNT-MASKED]',
+        'routing_number': '[ROUTING-MASKED]',
+        'credit_card': '****-****-****-****',
+        'phone': '(***) ***-****',
+        'email': '[EMAIL-MASKED]',
+    }
+    
+    @classmethod
+    def detect_pii(cls, text: str) -> Dict[str, List[str]]:
+        """
+        Detect PII in text and return found items by type.
+        
+        Args:
+            text: Input text to scan
+            
+        Returns:
+            Dictionary mapping PII type to list of found values
+        """
+        if not text:
+            return {}
+            
+        found = {}
+        for pii_type, patterns in cls.PATTERNS.items():
+            matches = []
+            for pattern in patterns:
+                matches.extend(re.findall(pattern, text, re.IGNORECASE))
+            if matches:
+                found[pii_type] = list(set(matches))  # Remove duplicates
+        return found
+    
+    @classmethod
+    def mask_pii(cls, text: str) -> Tuple[str, Dict[str, int]]:
+        """
+        Mask all PII in text and return masked text + count of masked items.
+        
+        Args:
+            text: Input text to mask
+            
+        Returns:
+            Tuple of (masked_text, {pii_type: count})
+        """
+        if not text:
+            return text, {}
+            
+        masked_text = text
+        masked_counts = {}
+        
+        for pii_type, patterns in cls.PATTERNS.items():
+            count = 0
+            for pattern in patterns:
+                matches = re.findall(pattern, masked_text, re.IGNORECASE)
+                count += len(matches)
+                masked_text = re.sub(pattern, cls.MASKS[pii_type], masked_text, flags=re.IGNORECASE)
+            if count > 0:
+                masked_counts[pii_type] = count
+        
+        return masked_text, masked_counts
+    
+    @classmethod
+    def mask_ssn(cls, text: str) -> str:
+        """Specifically mask only SSNs in text."""
+        if not text:
+            return text
+        for pattern in cls.PATTERNS['ssn']:
+            text = re.sub(pattern, cls.MASKS['ssn'], text)
+        return text
+    
+    @classmethod
+    def mask_ein(cls, text: str) -> str:
+        """Specifically mask only EINs in text."""
+        if not text:
+            return text
+        for pattern in cls.PATTERNS['ein']:
+            text = re.sub(pattern, cls.MASKS['ein'], text)
+        return text
+    
+    @classmethod
+    def get_pii_warning(cls, detected: Dict[str, List[str]]) -> str:
+        """
+        Generate a user-friendly warning message based on detected PII.
+        
+        Args:
+            detected: Dictionary of detected PII from detect_pii()
+            
+        Returns:
+            Formatted warning string
+        """
+        if not detected:
+            return ""
+        
+        warnings = ["⚠️ **Sensitive Information Detected & Masked:**"]
+        
+        pii_labels = {
+            'ssn': 'Social Security Number(s)',
+            'ein': 'Employer Identification Number(s)',
+            'bank_account': 'Bank Account Number(s)',
+            'routing_number': 'Routing Number(s)',
+            'credit_card': 'Credit Card Number(s)',
+            'phone': 'Phone Number(s)',
+            'email': 'Email Address(es)',
+        }
+        
+        for pii_type, items in detected.items():
+            label = pii_labels.get(pii_type, pii_type)
+            count = len(items) if isinstance(items, list) else items
+            warnings.append(f"• {count} {label} detected and masked")
+        
+        warnings.append("\n*Your sensitive data has been automatically protected.*")
+        
+        return "\n".join(warnings)
+    
+    @classmethod
+    def is_safe_to_process(cls, text: str) -> Tuple[bool, str]:
+        """
+        Check if text is safe to process (no critical PII).
+        
+        Args:
+            text: Input text to check
+            
+        Returns:
+            Tuple of (is_safe, warning_message)
+        """
+        detected = cls.detect_pii(text)
+        
+        # Critical PII types that should trigger warnings
+        critical_types = ['ssn', 'bank_account', 'credit_card']
+        
+        critical_found = {k: v for k, v in detected.items() if k in critical_types}
+        
+        if critical_found:
+            return False, cls.get_pii_warning(critical_found)
+        
+        return True, ""
+
+
+# ==========================================
+# Quick Test (remove in production)
+# ==========================================
+if __name__ == "__main__":
+    # Test PII detection
+    test_text = """
+    My SSN is 123-45-6789 and my employer's EIN is 12-3456789.
+    Call me at (555) 123-4567 or email test@example.com.
+    My account number is 12345678901234.
+    """
+    
+    print("Original text:")
+    print(test_text)
+    print("\n" + "="*50 + "\n")
+    
+    # Detect
+    detected = PIIHandler.detect_pii(test_text)
+    print("Detected PII:")
+    for pii_type, values in detected.items():
+        print(f"  {pii_type}: {values}")
+    
+    print("\n" + "="*50 + "\n")
+    
+    # Mask
+    masked, counts = PIIHandler.mask_pii(test_text)
+    print("Masked text:")
+    print(masked)
+    print(f"\nMasked counts: {counts}")
+    
+    print("\n" + "="*50 + "\n")
+    
+    # Warning
+    print("Warning message:")
+    print(PIIHandler.get_pii_warning(detected))
+
 # Fix sqlite3 issue
 try:
     __import__('pysqlite3')
